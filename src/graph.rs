@@ -1,0 +1,197 @@
+use serde::{Deserialize, Serialize};
+
+pub const GRAPH_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct NodeId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ShaderType {
+    F32,
+    Vec2,
+    Vec3,
+    Vec4,
+}
+
+impl ShaderType {
+    pub fn wgsl(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Vec2 => "vec2<f32>",
+            Self::Vec3 => "vec3<f32>",
+            Self::Vec4 => "vec4<f32>",
+        }
+    }
+
+    pub fn width(self) -> usize {
+        match self {
+            Self::F32 => 1,
+            Self::Vec2 => 2,
+            Self::Vec3 => 3,
+            Self::Vec4 => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Value {
+    F32(f32),
+    Vec2([f32; 2]),
+    Vec3([f32; 3]),
+    Vec4([f32; 4]),
+}
+
+impl Value {
+    pub fn shader_type(&self) -> ShaderType {
+        match self {
+            Self::F32(_) => ShaderType::F32,
+            Self::Vec2(_) => ShaderType::Vec2,
+            Self::Vec3(_) => ShaderType::Vec3,
+            Self::Vec4(_) => ShaderType::Vec4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NodeKind {
+    Constant(Value),
+    Uniform(Value),
+    Uv,
+    Time,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Sin,
+    Cos,
+    Abs,
+    Fract,
+    Normalize,
+    TextureSample,
+    FragmentOutput,
+}
+
+impl NodeKind {
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::Constant(_) => "Constant",
+            Self::Uniform(_) => "Uniform",
+            Self::Uv => "UV",
+            Self::Time => "Time",
+            Self::Add => "Add",
+            Self::Subtract => "Subtract",
+            Self::Multiply => "Multiply",
+            Self::Divide => "Divide",
+            Self::Sin => "Sine",
+            Self::Cos => "Cosine",
+            Self::Abs => "Absolute",
+            Self::Fract => "Fract",
+            Self::Normalize => "Normalize",
+            Self::TextureSample => "Texture Sample",
+            Self::FragmentOutput => "Fragment Output",
+        }
+    }
+
+    pub fn input_count(&self) -> usize {
+        match self {
+            Self::Constant(_) | Self::Uniform(_) | Self::Uv | Self::Time => 0,
+            Self::Sin
+            | Self::Cos
+            | Self::Abs
+            | Self::Fract
+            | Self::Normalize
+            | Self::FragmentOutput
+            | Self::TextureSample => 1,
+            Self::Add | Self::Subtract | Self::Multiply | Self::Divide => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Connection {
+    pub node: NodeId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    pub id: NodeId,
+    pub name: String,
+    pub position: [f32; 2],
+    pub kind: NodeKind,
+    pub inputs: Vec<Option<Connection>>,
+}
+
+impl Node {
+    pub fn new(id: NodeId, kind: NodeKind, position: [f32; 2]) -> Self {
+        let input_count = kind.input_count();
+        Self {
+            id,
+            name: kind.title().to_owned(),
+            position,
+            kind,
+            inputs: vec![None; input_count],
+        }
+    }
+
+    pub fn connect_input(&mut self, input: usize, source: NodeId) {
+        if let Some(socket) = self.inputs.get_mut(input) {
+            *socket = Some(Connection { node: source });
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShaderGraph {
+    pub format_version: u32,
+    pub nodes: Vec<Node>,
+}
+
+impl Default for ShaderGraph {
+    fn default() -> Self {
+        Self {
+            format_version: GRAPH_FORMAT_VERSION,
+            nodes: Vec::new(),
+        }
+    }
+}
+
+impl ShaderGraph {
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.iter().find(|node| node.id == id)
+    }
+
+    pub fn fragment_output(&self) -> Option<&Node> {
+        self.nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::FragmentOutput))
+    }
+
+    pub fn example() -> Self {
+        let color_id = NodeId(1);
+        let strength_id = NodeId(2);
+        let multiply_id = NodeId(3);
+        let output_id = NodeId(4);
+
+        let color = Node::new(
+            color_id,
+            NodeKind::Constant(Value::Vec4([0.12, 0.55, 1.0, 1.0])),
+            [60.0, 80.0],
+        );
+        let strength = Node::new(
+            strength_id,
+            NodeKind::Constant(Value::F32(0.8)),
+            [60.0, 260.0],
+        );
+        let mut multiply = Node::new(multiply_id, NodeKind::Multiply, [330.0, 150.0]);
+        multiply.connect_input(0, color_id);
+        multiply.connect_input(1, strength_id);
+
+        let mut output = Node::new(output_id, NodeKind::FragmentOutput, [600.0, 150.0]);
+        output.connect_input(0, multiply_id);
+
+        Self {
+            format_version: GRAPH_FORMAT_VERSION,
+            nodes: vec![color, strength, multiply, output],
+        }
+    }
+}

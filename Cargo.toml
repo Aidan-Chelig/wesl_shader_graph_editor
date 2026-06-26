@@ -1,8 +1,8 @@
 [package]
-name = "bevy_anim_graph_editor"
+name = "wesl_shader_graph_editor"
 version = "0.1.0"
 authors = ["Aidan Chelig"]
-description = "A Bevy animation graph editor and visualizer built with egui."
+description = "A typed node shader editor that generates portable WGSL and WESL."
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -17,6 +17,7 @@ bevy = { version = "0.19.0", default-features = true, features = [
   "bevy_text",
   "bevy_asset",
   "bevy_scene",
+  "shader_format_wesl",
   "bevy_state",
   "bevy_gltf",
   "multi_threaded",
@@ -27,12 +28,16 @@ bevy = { version = "0.19.0", default-features = true, features = [
   "x11",
   "wayland",
 ] }
+bevy_egui = "0.40.1"
 
 clap = { version = "4.5", features = ["derive"] }
+naga = { version = "29.0.3", features = ["wgsl-in"] }
 ron = "0.12"
 rfd = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
+tree-sitter = "0.20.10"
+tree-sitter-wgsl = "0.0.6"
 tracing = { version = "0.1", features = [
   "max_level_debug",
   "release_max_level_warn",
