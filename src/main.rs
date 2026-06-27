@@ -1,19 +1,31 @@
-use std::collections::HashMap;
-
-use bevy::prelude::*;
-use bevy_egui::{
-    EguiContexts, EguiPlugin, EguiPrimaryContextPass, EguiStartupSet, PrimaryEguiContext, egui,
+use bevy::{
+    asset::RenderAssetUsages,
+    prelude::*,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
+use bevy_egui::{EguiContexts, EguiPlugin, EguiStartupSet, PrimaryEguiContext, egui};
+use egui_graph_edit::{InputId as UiInputId, NodeId as UiNodeId, NodeResponse};
+use serde::Serialize;
 use tree_sitter::{Node as SyntaxNode, Parser};
 use wesl_shader_graph_editor::{
     compiler::{CompiledShader, compile_with_preview_node},
-    graph::{Node, NodeId, NodeKind, ShaderGraph, ShaderType, Value},
+    graph::{ModuleDefinition, ModulePort, NodeId, NodeKind, ShaderGraph, ShaderType, Value},
 };
 
+mod graph_editor;
 mod preview;
 
+use image::GenericImageView;
+
+use graph_editor::{
+    GraphNodeTemplate, GraphNodeTemplates, GraphResponse as ShaderGraphResponse, GraphUiState,
+    GraphValueChangeKind, ShaderGraphEditorState, add_kind_to_editor, add_template_to_editor,
+    begin_connection_context, begin_disconnected_input_context, connect_new_node_to_context,
+    editor_from_shader_graph, shader_graph_from_editor, template_label,
+};
 use preview::{
-    PreviewPlugin, PreviewPrimitive, PreviewSettings, PreviewShaderSource, PreviewUniformValues,
+    PreviewPlugin, PreviewPrimitive, PreviewSettings, PreviewShaderSource, PreviewTexture,
+    PreviewUniformValues,
 };
 
 fn main() {
@@ -28,26 +40,37 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins(EguiPlugin::default())
+        .add_plugins(EguiPlugin {
+            #[allow(deprecated)]
+            enable_multipass_for_primary_context: false,
+            ..default()
+        })
         .add_plugins(PreviewPlugin)
         .add_systems(
             PreStartup,
             setup_camera.before(EguiStartupSet::InitContexts),
         )
-        .add_systems(EguiPrimaryContextPass, editor_ui)
+        .add_systems(Update, editor_ui)
         .run();
 }
 
 #[derive(Resource)]
 struct EditorState {
     graph: ShaderGraph,
+    graph_editor: ShaderGraphEditorState,
+    graph_ui: GraphUiState,
     compilation: Result<CompiledShader, String>,
     selected: Option<NodeId>,
-    pending_connection: Option<NodeId>,
+    hovered: Option<NodeId>,
     preview_node: Option<NodeId>,
-    next_node_id: u64,
     spawn_offset: f32,
     source_view: SourceView,
+    texture_path: Option<String>,
+    pending_texture_path: Option<String>,
+    export_status: Option<String>,
+    node_context_menu: Option<NodeContextMenu>,
+    module_prompt: Option<ModulePrompt>,
+    modules: Vec<ModuleDefinition>,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -61,20 +84,49 @@ enum SourceView {
 impl Default for EditorState {
     fn default() -> Self {
         let graph = ShaderGraph::example();
+        let (graph_editor, graph_ui) = editor_from_shader_graph(&graph);
         let compilation =
             compile_with_preview_node(&graph, None).map_err(|error| error.to_string());
-        let next_node_id = graph.nodes.iter().map(|node| node.id.0).max().unwrap_or(0) + 1;
         Self {
             graph,
+            graph_editor,
+            graph_ui,
             compilation,
             selected: None,
-            pending_connection: None,
+            hovered: None,
             preview_node: None,
-            next_node_id,
             spawn_offset: 0.0,
             source_view: SourceView::Wesl,
+            texture_path: None,
+            pending_texture_path: None,
+            export_status: None,
+            node_context_menu: None,
+            module_prompt: None,
+            modules: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct NodeContextMenu {
+    node: UiNodeId,
+    position: egui::Pos2,
+}
+
+#[derive(Clone, Debug)]
+struct ModulePrompt {
+    root: UiNodeId,
+    position: egui::Pos2,
+    module_name: String,
+    save_to_user_library: bool,
+}
+
+#[derive(Serialize)]
+struct ProjectFile {
+    graph: ShaderGraph,
+    preview_node: Option<NodeId>,
+    texture_path: Option<String>,
+    modules: Vec<ModuleDefinition>,
 }
 
 fn setup_camera(mut commands: Commands) {
@@ -91,9 +143,12 @@ fn editor_ui(
     mut preview: ResMut<PreviewSettings>,
     mut preview_shader: ResMut<PreviewShaderSource>,
     mut preview_uniforms: ResMut<PreviewUniformValues>,
+    mut images: ResMut<Assets<Image>>,
+    mut preview_texture: ResMut<PreviewTexture>,
     mut highlighter: Local<SourceHighlighter>,
 ) -> Result {
     let context = contexts.ctx_mut()?;
+    let state = state.as_mut();
     let mut recompile_requested = false;
     let mut viewport_ui = egui::Ui::new(
         context.clone(),
@@ -111,70 +166,26 @@ fn editor_ui(
                 recompile_requested = true;
             }
             ui.separator();
+            draw_file_menu(ui, state);
+            ui.separator();
             ui.menu_button("Add Node", |ui| {
-                if add_node_button(ui, &mut state, NodeKind::Uv) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Time) {
-                    ui.close();
-                    recompile_requested = true;
-                }
-                ui.separator();
-                if add_node_button(ui, &mut state, NodeKind::Constant(Value::F32(1.0))) {
-                    ui.close();
-                    recompile_requested = true;
-                }
-                if add_node_button(
-                    ui,
-                    &mut state,
-                    NodeKind::Constant(Value::Vec4([1.0, 1.0, 1.0, 1.0])),
-                ) {
-                    ui.close();
-                    recompile_requested = true;
-                }
-                if add_node_button(ui, &mut state, NodeKind::Uniform(Value::F32(1.0))) {
-                    ui.close();
-                    recompile_requested = true;
-                }
-                if add_node_button(
-                    ui,
-                    &mut state,
-                    NodeKind::Uniform(Value::Vec4([1.0, 1.0, 1.0, 1.0])),
-                ) {
-                    ui.close();
-                    recompile_requested = true;
-                }
-                ui.separator();
-                if add_node_button(ui, &mut state, NodeKind::Add) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Subtract) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Multiply) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Divide) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Sin) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Cos) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Abs) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Fract) {
-                    ui.close();
-                }
-                if add_node_button(ui, &mut state, NodeKind::Normalize) {
-                    ui.close();
-                }
-                ui.separator();
-                if add_node_button(ui, &mut state, NodeKind::TextureSample) {
-                    ui.close();
+                for template in GraphNodeTemplate::TOOLBAR {
+                    if ui.button(template_label(&template)).clicked() {
+                        let position = egui::pos2(
+                            90.0 + state.spawn_offset,
+                            430.0 + state.spawn_offset * 0.35,
+                        );
+                        state.spawn_offset = (state.spawn_offset + 32.0) % 260.0;
+                        add_template_to_editor(
+                            &mut state.graph_editor,
+                            &mut state.graph_ui,
+                            template,
+                            position,
+                        );
+                        state.graph = shader_graph_from_editor(&state.graph_editor);
+                        recompile_requested = true;
+                        ui.close();
+                    }
                 }
             });
             ui.separator();
@@ -200,6 +211,10 @@ fn editor_ui(
                     ui.colored_label(egui::Color32::from_rgb(240, 95, 95), error);
                 }
             }
+            if let Some(status) = &state.export_status {
+                ui.separator();
+                ui.label(status);
+            }
         });
     });
 
@@ -224,12 +239,13 @@ fn editor_ui(
                         SourceView::Wgsl => compiled.wgsl.clone(),
                         SourceView::BevyWesl => compiled.bevy_wesl.clone(),
                     };
-                    let mut layouter =
-                        |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                            let mut layout_job = highlighter.highlight(text.as_str());
-                            layout_job.wrap.max_width = wrap_width;
-                            ui.fonts_mut(|fonts| fonts.layout_job(layout_job))
-                        };
+                    let mut layouter = |ui: &egui::Ui,
+                                        text: &dyn egui::TextBuffer,
+                                        wrap_width: f32| {
+                        let mut layout_job = highlighter.highlight(text.as_str(), state.hovered);
+                        layout_job.wrap.max_width = wrap_width;
+                        ui.fonts_mut(|fonts| fonts.layout_job(layout_job))
+                    };
                     ui.add(
                         egui::TextEdit::multiline(&mut source)
                             .code_editor()
@@ -249,16 +265,738 @@ fn editor_ui(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show_inside(&mut viewport_ui, |ui| {
-            graph_edit = draw_graph(ui, &mut state);
+            let had_connection_in_progress = state.graph_editor.connection_in_progress.is_some();
+            let had_node_finder = state.graph_editor.node_finder.is_some();
+            let node_templates =
+                GraphNodeTemplates::compatible_with(state.graph_ui.connection_context);
+            let response = state.graph_editor.draw_graph_editor(
+                ui,
+                node_templates,
+                &mut state.graph_ui,
+                Vec::new(),
+            );
+
+            state.hovered = None;
+            for node_response in response.node_responses {
+                match node_response {
+                    NodeResponse::CreatedNode(node_id) => {
+                        connect_new_node_to_context(
+                            &mut state.graph_editor,
+                            &mut state.graph_ui,
+                            node_id,
+                        );
+                        graph_edit.source_changed = true;
+                    }
+                    NodeResponse::ConnectEventEnded { .. }
+                    | NodeResponse::DeleteNodeFull { .. }
+                    | NodeResponse::DeleteNodeUi(_) => {
+                        state.graph_ui.connection_context = None;
+                        graph_edit.source_changed = true;
+                    }
+                    NodeResponse::DisconnectEvent { output, .. } => {
+                        begin_disconnected_input_context(
+                            &state.graph_editor,
+                            &mut state.graph_ui,
+                            output,
+                        );
+                        graph_edit.source_changed = true;
+                    }
+                    NodeResponse::MoveNode { .. } => {
+                        graph_edit.position_changed = true;
+                    }
+                    NodeResponse::HoverNode(node_id) => {
+                        if let Some(node) = state.graph_editor.graph.nodes.get(node_id) {
+                            state.hovered = Some(node.user_data.shader_id);
+                        }
+                    }
+                    NodeResponse::SelectConnectedNode(node_id) => {
+                        select_contiguous_nodes(&mut state.graph_editor, node_id);
+                        if let Some(node) = state.graph_editor.graph.nodes.get(node_id) {
+                            state.selected = Some(node.user_data.shader_id);
+                        }
+                    }
+                    NodeResponse::ContextNode(node_id, position) => {
+                        state.node_context_menu = Some(NodeContextMenu {
+                            node: node_id,
+                            position,
+                        });
+                    }
+                    NodeResponse::SelectNode(node_id) => {
+                        if let Some(node) = state.graph_editor.graph.nodes.get(node_id) {
+                            state.selected = Some(node.user_data.shader_id);
+                        }
+                    }
+                    NodeResponse::User(ShaderGraphResponse::ValueChanged { node, value, kind }) => {
+                        apply_graph_editor_value_change(&mut state.graph_editor, node, value);
+                        match kind {
+                            GraphValueChangeKind::Source => graph_edit.source_changed = true,
+                            GraphValueChangeKind::Uniform => {
+                                graph_edit.uniform_values_changed = true;
+                            }
+                        }
+                    }
+                    NodeResponse::User(ShaderGraphResponse::RenameNode { node, name }) => {
+                        if !name.is_empty() {
+                            rename_graph_editor_node(&mut state.graph_editor, node, &name);
+                            graph_edit.source_changed = true;
+                        }
+                    }
+                    NodeResponse::User(ShaderGraphResponse::PreviewChanged) => {
+                        graph_edit.preview_changed = true;
+                    }
+                    NodeResponse::User(ShaderGraphResponse::LoadTextureRequested) => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga", "hdr"])
+                            .pick_file()
+                        {
+                            state.pending_texture_path = Some(path.display().to_string());
+                        }
+                    }
+                    NodeResponse::ConnectEventStarted(_, port) => {
+                        begin_connection_context(&state.graph_editor, &mut state.graph_ui, port);
+                    }
+                    NodeResponse::RaiseNode(_) => {}
+                }
+            }
+
+            draw_node_context_menu(ui, state);
+            draw_module_prompt(ui, state, &mut graph_edit);
+
+            let has_connection_in_progress = state.graph_editor.connection_in_progress.is_some();
+            let has_node_finder = state.graph_editor.node_finder.is_some();
+            let opened_finder_from_connection =
+                !had_node_finder && has_node_finder && had_connection_in_progress;
+            if state.graph_ui.connection_context.is_some()
+                && !has_connection_in_progress
+                && (!has_node_finder || (!had_node_finder && !opened_finder_from_connection))
+            {
+                state.graph_ui.connection_context = None;
+            }
+
+            if graph_edit.source_changed
+                || graph_edit.uniform_values_changed
+                || graph_edit.position_changed
+            {
+                state.graph = shader_graph_from_editor(&state.graph_editor);
+            }
+            if graph_edit.preview_changed {
+                state.preview_node = state.graph_ui.preview_node;
+            }
         });
 
+    if let Some(path) = state.pending_texture_path.take() {
+        match load_texture_image(&path, &mut images) {
+            Ok(handle) => {
+                state.texture_path = Some(path);
+                state.graph_ui.texture_path.clone_from(&state.texture_path);
+                preview_texture.handle = handle;
+                preview_texture.path = state.texture_path.clone();
+                recompile_requested = true;
+            }
+            Err(error) => {
+                tracing::error!("Failed to load texture {path}: {error}");
+            }
+        }
+    }
+
     if recompile_requested || graph_edit.source_changed || graph_edit.preview_changed {
-        recompile_graph(&mut state, &mut preview_shader, &mut preview_uniforms);
+        recompile_graph(state, &mut preview_shader, &mut preview_uniforms);
     } else if graph_edit.uniform_values_changed {
-        sync_preview_uniforms(&state, &mut preview_uniforms);
+        sync_preview_uniforms(state, &mut preview_uniforms);
     }
 
     Ok(())
+}
+
+fn draw_file_menu(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.menu_button("File", |ui| {
+        if ui.button("Export Project...").clicked() {
+            state.export_status = Some(match export_project(state) {
+                Ok(path) => format!("Exported project to {}", path.display()),
+                Err(error) => format!("Project export failed: {error}"),
+            });
+            ui.close();
+        }
+
+        ui.separator();
+        match state.compilation.clone() {
+            Ok(compiled) => {
+                if ui.button("Export Generated WESL...").clicked() {
+                    state.export_status = Some(
+                        match export_text_file(
+                            "Export Generated WESL",
+                            "shader_graph.wesl",
+                            "WESL",
+                            &["wesl"],
+                            &compiled.wesl,
+                        ) {
+                            Ok(path) => format!("Exported WESL to {}", path.display()),
+                            Err(error) => format!("WESL export failed: {error}"),
+                        },
+                    );
+                    ui.close();
+                }
+                if ui.button("Export Linked WGSL...").clicked() {
+                    state.export_status = Some(
+                        match export_text_file(
+                            "Export Linked WGSL",
+                            "shader_graph.wgsl",
+                            "WGSL",
+                            &["wgsl"],
+                            &compiled.wgsl,
+                        ) {
+                            Ok(path) => format!("Exported WGSL to {}", path.display()),
+                            Err(error) => format!("WGSL export failed: {error}"),
+                        },
+                    );
+                    ui.close();
+                }
+                if ui.button("Export Bevy Preview WESL...").clicked() {
+                    state.export_status = Some(
+                        match export_text_file(
+                            "Export Bevy Preview WESL",
+                            "shader_graph_preview.wesl",
+                            "WESL",
+                            &["wesl"],
+                            &compiled.bevy_wesl,
+                        ) {
+                            Ok(path) => format!("Exported Bevy preview WESL to {}", path.display()),
+                            Err(error) => format!("Bevy preview WESL export failed: {error}"),
+                        },
+                    );
+                    ui.close();
+                }
+                if ui.button("Export Bevy Preview WGSL...").clicked() {
+                    state.export_status = Some(
+                        match export_text_file(
+                            "Export Bevy Preview WGSL",
+                            "shader_graph_preview.wgsl",
+                            "WGSL",
+                            &["wgsl"],
+                            &compiled.bevy_wgsl,
+                        ) {
+                            Ok(path) => format!("Exported Bevy preview WGSL to {}", path.display()),
+                            Err(error) => format!("Bevy preview WGSL export failed: {error}"),
+                        },
+                    );
+                    ui.close();
+                }
+                if ui.button("Export All Shader Files...").clicked() {
+                    state.export_status = Some(match export_all_shader_files(&compiled) {
+                        Ok(path) => format!("Exported shader files to {}", path.display()),
+                        Err(error) => format!("Shader export failed: {error}"),
+                    });
+                    ui.close();
+                }
+            }
+            Err(error) => {
+                ui.add_enabled_ui(false, |ui| {
+                    let _ = ui.button("Export Generated WESL...");
+                    let _ = ui.button("Export Linked WGSL...");
+                    let _ = ui.button("Export Bevy Preview WESL...");
+                    let _ = ui.button("Export Bevy Preview WGSL...");
+                    let _ = ui.button("Export All Shader Files...");
+                });
+                ui.colored_label(egui::Color32::from_rgb(240, 95, 95), error);
+            }
+        }
+    });
+}
+
+fn export_project(state: &EditorState) -> Result<std::path::PathBuf, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("Export Project")
+        .add_filter("RON", &["ron"])
+        .set_file_name("shader_graph_project.ron")
+        .save_file()
+        .ok_or_else(|| "cancelled".to_owned())?;
+    let project = ProjectFile {
+        graph: state.graph.clone(),
+        preview_node: state.preview_node,
+        texture_path: state.texture_path.clone(),
+        modules: state.modules.clone(),
+    };
+    let source = ron::ser::to_string_pretty(&project, ron::ser::PrettyConfig::new())
+        .map_err(|error| error.to_string())?;
+    std::fs::write(&path, source).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn export_text_file(
+    title: &str,
+    file_name: &str,
+    filter_name: &str,
+    extensions: &[&str],
+    source: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter(filter_name, extensions)
+        .set_file_name(file_name)
+        .save_file()
+        .ok_or_else(|| "cancelled".to_owned())?;
+    std::fs::write(&path, source).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn export_all_shader_files(compiled: &CompiledShader) -> Result<std::path::PathBuf, String> {
+    let directory = rfd::FileDialog::new()
+        .set_title("Export All Shader Files")
+        .pick_folder()
+        .ok_or_else(|| "cancelled".to_owned())?;
+    let files = [
+        ("shader_graph.wesl", compiled.wesl.as_str()),
+        ("shader_graph.wgsl", compiled.wgsl.as_str()),
+        ("shader_graph_preview.wesl", compiled.bevy_wesl.as_str()),
+        ("shader_graph_preview.wgsl", compiled.bevy_wgsl.as_str()),
+    ];
+    for (file_name, source) in files {
+        std::fs::write(directory.join(file_name), source).map_err(|error| error.to_string())?;
+    }
+    Ok(directory)
+}
+
+fn select_contiguous_nodes(editor: &mut ShaderGraphEditorState, start: UiNodeId) {
+    let selected = contiguous_ui_nodes(editor, start);
+    editor.selected_nodes = selected;
+}
+
+fn contiguous_ui_nodes(editor: &ShaderGraphEditorState, start: UiNodeId) -> Vec<UiNodeId> {
+    let mut selected = Vec::new();
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        if selected.contains(&node) {
+            continue;
+        }
+        selected.push(node);
+
+        for (input, output) in editor.graph.iter_connections() {
+            let input_node = editor.graph.get_input(input).node;
+            let output_node = editor.graph.get_output(output).node;
+            if input_node == node && !selected.contains(&output_node) {
+                stack.push(output_node);
+            }
+            if output_node == node && !selected.contains(&input_node) {
+                stack.push(input_node);
+            }
+        }
+    }
+    selected
+}
+
+fn draw_node_context_menu(ui: &mut egui::Ui, state: &mut EditorState) {
+    let Some(menu) = state.node_context_menu.clone() else {
+        return;
+    };
+
+    let mut close = false;
+    egui::Area::new("node_context_menu".into())
+        .order(egui::Order::Foreground)
+        .fixed_pos(menu.position)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                if ui.button("Create Module Node").clicked() {
+                    state.module_prompt = Some(ModulePrompt {
+                        root: menu.node,
+                        position: menu.position,
+                        module_name: format!("Module {}", state.modules.len() + 1),
+                        save_to_user_library: false,
+                    });
+                    close = true;
+                }
+            });
+        });
+
+    if close || ui.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
+        state.node_context_menu = None;
+    }
+}
+
+fn draw_module_prompt(ui: &mut egui::Ui, state: &mut EditorState, graph_edit: &mut GraphEdit) {
+    let Some(mut prompt) = state.module_prompt.clone() else {
+        return;
+    };
+
+    let mut close = false;
+    egui::Window::new("Create Module Node")
+        .id("create_module_prompt".into())
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(prompt.position)
+        .show(ui.ctx(), |ui| {
+            ui.label("Node name");
+            ui.text_edit_singleline(&mut prompt.module_name);
+            ui.checkbox(
+                &mut prompt.save_to_user_library,
+                "Also save to user module library",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Create").clicked() {
+                    match create_module_from_selection(state, prompt.root, &prompt.module_name) {
+                        Ok(module) => {
+                            let summary = module_summary(&module);
+                            let save_status = if prompt.save_to_user_library {
+                                match save_user_module(&module) {
+                                    Ok(path) => format!(" · saved to {}", path.display()),
+                                    Err(error) => format!(" · local save failed: {error}"),
+                                }
+                            } else {
+                                " · packed into project".to_owned()
+                            };
+                            match replace_selection_with_module(state, prompt.root, &module) {
+                                Ok(()) => {
+                                    state.modules.push(module);
+                                    state.export_status = Some(format!("{summary}{save_status}"));
+                                    graph_edit.source_changed = true;
+                                    graph_edit.preview_changed = true;
+                                    close = true;
+                                }
+                                Err(error) => {
+                                    state.export_status =
+                                        Some(format!("Create module failed: {error}"));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            state.export_status = Some(format!("Create module failed: {error}"));
+                        }
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.module_prompt = None;
+    } else if let Some(current) = &mut state.module_prompt {
+        *current = prompt;
+    }
+}
+
+fn create_module_from_selection(
+    state: &EditorState,
+    root_ui_node: UiNodeId,
+    module_name: &str,
+) -> Result<ModuleDefinition, String> {
+    let selected_ui_nodes = if state.graph_editor.selected_nodes.contains(&root_ui_node) {
+        state.graph_editor.selected_nodes.clone()
+    } else {
+        contiguous_ui_nodes(&state.graph_editor, root_ui_node)
+    };
+    if selected_ui_nodes.is_empty() {
+        return Err("no nodes selected".to_owned());
+    }
+
+    let mut shader_nodes = selected_ui_nodes
+        .iter()
+        .filter_map(|node| state.graph_editor.graph.nodes.get(*node))
+        .map(|node| node.user_data.shader_id)
+        .collect::<Vec<_>>();
+    shader_nodes.sort_by_key(|id| id.0);
+    shader_nodes.dedup();
+
+    let root = state
+        .graph_editor
+        .graph
+        .nodes
+        .get(root_ui_node)
+        .map(|node| node.user_data.shader_id)
+        .ok_or_else(|| "context node no longer exists".to_owned())?;
+
+    let input_node_set = shader_nodes
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut inputs = state
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| input_node_set.contains(&node.id))
+        .filter_map(|node| {
+            if let NodeKind::Uniform(value) = &node.kind {
+                Some(ModulePort {
+                    name: node.name.clone(),
+                    shader_type: value.shader_type(),
+                    node: Some(node.id),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    inputs.sort_by_key(|input| input.node.map_or(0, |node| node.0));
+
+    let output_type = state
+        .compilation
+        .as_ref()
+        .ok()
+        .and_then(|compiled| compiled.node_types.get(&root).copied())
+        .unwrap_or(ShaderType::Vec4);
+    let graph = module_subgraph_from_nodes(&state.graph, &shader_nodes);
+
+    Ok(ModuleDefinition {
+        id: state.modules.len() as u64 + 1,
+        name: sanitized_module_display_name(module_name, state.modules.len() + 1),
+        root,
+        nodes: shader_nodes,
+        inputs,
+        output: ModulePort {
+            name: "Output".to_owned(),
+            shader_type: output_type,
+            node: Some(root),
+        },
+        graph: Box::new(graph),
+    })
+}
+
+fn replace_selection_with_module(
+    state: &mut EditorState,
+    root_ui_node: UiNodeId,
+    module: &ModuleDefinition,
+) -> Result<(), String> {
+    let selected_ui_nodes = if state.graph_editor.selected_nodes.contains(&root_ui_node) {
+        state.graph_editor.selected_nodes.clone()
+    } else {
+        contiguous_ui_nodes(&state.graph_editor, root_ui_node)
+    };
+    if selected_ui_nodes.is_empty() {
+        return Err("no nodes selected".to_owned());
+    }
+
+    let selected_set = selected_ui_nodes
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let root_shader = state
+        .graph_editor
+        .graph
+        .nodes
+        .get(root_ui_node)
+        .map(|node| node.user_data.shader_id)
+        .ok_or_else(|| "context node no longer exists".to_owned())?;
+
+    let outgoing_targets = state
+        .graph_editor
+        .graph
+        .iter_connections()
+        .filter_map(|(input_id, output_id)| {
+            let input_node = state.graph_editor.graph.get_input(input_id).node;
+            let output_node = state.graph_editor.graph.get_output(output_id).node;
+            let output_shader = state
+                .graph_editor
+                .graph
+                .nodes
+                .get(output_node)
+                .map(|node| node.user_data.shader_id)?;
+            (selected_set.contains(&output_node)
+                && !selected_set.contains(&input_node)
+                && output_shader == root_shader)
+                .then_some(input_id)
+        })
+        .collect::<Vec<UiInputId>>();
+
+    let position = average_node_position(&state.graph_editor, &selected_ui_nodes)
+        .unwrap_or(egui::pos2(240.0, 240.0));
+
+    for node_id in selected_ui_nodes {
+        if state.graph_editor.graph.nodes.contains_key(node_id) {
+            state.graph_editor.graph.remove_node(node_id);
+        }
+        state
+            .graph_editor
+            .node_order
+            .retain(|node| *node != node_id);
+        state.graph_editor.node_positions.remove(node_id);
+        state.graph_editor.node_orientations.remove(node_id);
+        state
+            .graph_editor
+            .selected_nodes
+            .retain(|node| *node != node_id);
+    }
+
+    let module_kind = NodeKind::Module(Box::new(module.clone()));
+    let (module_ui_node, module_shader_id) = add_kind_to_editor(
+        &mut state.graph_editor,
+        &mut state.graph_ui,
+        module_kind,
+        module.name.clone(),
+        position,
+    );
+
+    if let Some(module_output) = state.graph_editor.graph.nodes[module_ui_node]
+        .outputs
+        .first()
+        .map(|(_, output)| *output)
+    {
+        for input_id in outgoing_targets {
+            if state.graph_editor.graph.inputs.contains_key(input_id) {
+                state
+                    .graph_editor
+                    .graph
+                    .add_connection(module_output, input_id);
+            }
+        }
+    }
+
+    state.graph_editor.selected_nodes = vec![module_ui_node];
+    state.selected = Some(module_shader_id);
+    if state
+        .preview_node
+        .is_some_and(|preview_node| module.nodes.contains(&preview_node))
+    {
+        state.preview_node = Some(module_shader_id);
+        state.graph_ui.preview_node = Some(module_shader_id);
+    }
+    state.graph = shader_graph_from_editor(&state.graph_editor);
+    Ok(())
+}
+
+fn average_node_position(
+    editor: &ShaderGraphEditorState,
+    nodes: &[UiNodeId],
+) -> Option<egui::Pos2> {
+    let positions = nodes
+        .iter()
+        .filter_map(|node| editor.node_positions.get(*node))
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return None;
+    }
+    let sum = positions
+        .iter()
+        .fold(egui::Vec2::ZERO, |sum, position| sum + position.to_vec2());
+    Some(egui::pos2(
+        sum.x / positions.len() as f32,
+        sum.y / positions.len() as f32,
+    ))
+}
+
+fn rename_graph_editor_node(editor: &mut ShaderGraphEditorState, shader_node: NodeId, name: &str) {
+    for (_, node) in &mut editor.graph.nodes {
+        if node.user_data.shader_id == shader_node {
+            node.label = name.to_owned();
+            break;
+        }
+    }
+}
+
+fn save_user_module(module: &ModuleDefinition) -> Result<std::path::PathBuf, String> {
+    let directory = user_modules_dir()?;
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let file_name = format!("{}.ron", module_file_stem(&module.name));
+    let path = unique_module_path(&directory, &file_name);
+    let project = ProjectFile {
+        graph: (*module.graph).clone(),
+        preview_node: Some(module.root),
+        texture_path: None,
+        modules: vec![module.clone()],
+    };
+    let source = ron::ser::to_string_pretty(&project, ron::ser::PrettyConfig::new())
+        .map_err(|error| error.to_string())?;
+    std::fs::write(&path, source).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn module_subgraph_from_nodes(graph: &ShaderGraph, nodes: &[NodeId]) -> ShaderGraph {
+    let node_set = nodes
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node_set.contains(&node.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for node in &mut nodes {
+        for input in &mut node.inputs {
+            if input.is_some_and(|connection| !node_set.contains(&connection.node)) {
+                *input = None;
+            }
+        }
+    }
+    ShaderGraph {
+        format_version: graph.format_version,
+        nodes,
+    }
+}
+
+fn user_modules_dir() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("wesl_shader_graph")
+        .join("user_modules"))
+}
+
+fn sanitized_module_display_name(name: &str, fallback_index: usize) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        format!("Module {fallback_index}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn module_file_stem(name: &str) -> String {
+    let stem = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_owned();
+    if stem.is_empty() {
+        "module".to_owned()
+    } else {
+        stem
+    }
+}
+
+fn unique_module_path(directory: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let initial = directory.join(file_name);
+    if !initial.exists() {
+        return initial;
+    }
+    let stem = file_name.trim_end_matches(".ron");
+    for index in 2.. {
+        let path = directory.join(format!("{stem}_{index}.ron"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    unreachable!("unbounded loop must return a non-existing module path")
+}
+
+fn module_summary(module: &ModuleDefinition) -> String {
+    let input_summary = if module.inputs.is_empty() {
+        "no inputs".to_owned()
+    } else {
+        module
+            .inputs
+            .iter()
+            .map(|input| format!("{}: {}", input.name, input.shader_type.wgsl()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Created {} #{} from {} nodes · inputs [{}] · output {}: {} from node {}",
+        module.name,
+        module.id,
+        module.nodes.len(),
+        input_summary,
+        module.output.name,
+        module.output.shader_type.wgsl(),
+        module.root.0,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,9 +1018,16 @@ struct HighlightSpan {
     kind: HighlightKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeHighlightRange {
+    start: usize,
+    end: usize,
+}
+
 struct SourceHighlighter {
     parser: Parser,
     cached_source: String,
+    cached_hovered: Option<NodeId>,
     cached_job: egui::text::LayoutJob,
 }
 
@@ -295,22 +1040,24 @@ impl Default for SourceHighlighter {
         Self {
             parser,
             cached_source: String::new(),
+            cached_hovered: None,
             cached_job: egui::text::LayoutJob::default(),
         }
     }
 }
 
 impl SourceHighlighter {
-    fn highlight(&mut self, source: &str) -> egui::text::LayoutJob {
-        if self.cached_source != source {
+    fn highlight(&mut self, source: &str, hovered: Option<NodeId>) -> egui::text::LayoutJob {
+        if self.cached_source != source || self.cached_hovered != hovered {
             self.cached_source.clear();
             self.cached_source.push_str(source);
-            self.cached_job = self.build_layout_job(source);
+            self.cached_hovered = hovered;
+            self.cached_job = self.build_layout_job(source, hovered);
         }
         self.cached_job.clone()
     }
 
-    fn build_layout_job(&mut self, source: &str) -> egui::text::LayoutJob {
+    fn build_layout_job(&mut self, source: &str, hovered: Option<NodeId>) -> egui::text::LayoutJob {
         let mut spans = Vec::new();
         if let Some(tree) = self.parser.parse(source, None) {
             collect_highlight_spans(tree.root_node(), source.as_bytes(), &mut spans);
@@ -318,6 +1065,7 @@ impl SourceHighlighter {
         spans.sort_by_key(|span| (span.start, span.end));
         spans.dedup_by_key(|span| (span.start, span.end));
 
+        let node_highlights = node_highlight_ranges(source, hovered);
         let mut job = egui::text::LayoutJob::default();
         let mut cursor = 0;
         for span in spans {
@@ -325,13 +1073,27 @@ impl SourceHighlighter {
                 continue;
             }
             if cursor < span.start {
-                append_source_text(&mut job, &source[cursor..span.start], None);
+                append_source_text(&mut job, source, cursor, span.start, None, &node_highlights);
             }
-            append_source_text(&mut job, &source[span.start..span.end], Some(span.kind));
+            append_source_text(
+                &mut job,
+                source,
+                span.start,
+                span.end,
+                Some(span.kind),
+                &node_highlights,
+            );
             cursor = span.end;
         }
         if cursor < source.len() {
-            append_source_text(&mut job, &source[cursor..], None);
+            append_source_text(
+                &mut job,
+                source,
+                cursor,
+                source.len(),
+                None,
+                &node_highlights,
+            );
         }
         job
     }
@@ -395,15 +1157,78 @@ fn token_text<'a>(node: SyntaxNode, source: &'a [u8]) -> Option<&'a str> {
     std::str::from_utf8(&source[node.start_byte()..node.end_byte()]).ok()
 }
 
-fn append_source_text(
-    job: &mut egui::text::LayoutJob,
-    text: &str,
-    highlight: Option<HighlightKind>,
-) {
-    job.append(text, 0.0, text_format(highlight));
+fn node_highlight_ranges(source: &str, hovered: Option<NodeId>) -> Vec<NodeHighlightRange> {
+    let mut ranges = Vec::new();
+    if let Some(node_id) = hovered {
+        ranges.extend(
+            source_ranges_for_node(source, node_id)
+                .into_iter()
+                .map(|(start, end)| NodeHighlightRange { start, end }),
+        );
+    }
+    ranges
 }
 
-fn text_format(highlight: Option<HighlightKind>) -> egui::TextFormat {
+fn source_ranges_for_node(source: &str, node_id: NodeId) -> Vec<(usize, usize)> {
+    let marker = format!("// node: {} ", node_id.0);
+    source
+        .match_indices(&marker)
+        .filter_map(|(marker_start, _)| {
+            let line_start = source[..marker_start]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let comment_line_end = source[marker_start..]
+                .find('\n')
+                .map_or(source.len(), |offset| marker_start + offset + 1);
+            let next_line_end = if comment_line_end < source.len() {
+                source[comment_line_end..]
+                    .find('\n')
+                    .map_or(source.len(), |offset| comment_line_end + offset + 1)
+            } else {
+                comment_line_end
+            };
+            (line_start < next_line_end).then_some((line_start, next_line_end))
+        })
+        .collect()
+}
+
+fn append_source_text(
+    job: &mut egui::text::LayoutJob,
+    source: &str,
+    start: usize,
+    end: usize,
+    highlight: Option<HighlightKind>,
+    node_highlights: &[NodeHighlightRange],
+) {
+    let mut cursor = start;
+    while cursor < end {
+        let next = next_node_highlight_boundary(cursor, end, node_highlights);
+        let strength = node_highlight_at(cursor, node_highlights);
+        job.append(&source[cursor..next], 0.0, text_format(highlight, strength));
+        cursor = next;
+    }
+}
+
+fn next_node_highlight_boundary(
+    cursor: usize,
+    end: usize,
+    node_highlights: &[NodeHighlightRange],
+) -> usize {
+    node_highlights
+        .iter()
+        .flat_map(|range| [range.start, range.end])
+        .filter(|boundary| *boundary > cursor && *boundary < end)
+        .min()
+        .unwrap_or(end)
+}
+
+fn node_highlight_at(position: usize, node_highlights: &[NodeHighlightRange]) -> bool {
+    node_highlights
+        .iter()
+        .any(|range| position >= range.start && position < range.end)
+}
+
+fn text_format(highlight: Option<HighlightKind>, node_highlight: bool) -> egui::TextFormat {
     let color = match highlight {
         Some(HighlightKind::Keyword) => egui::Color32::from_rgb(197, 134, 255),
         Some(HighlightKind::Type) => egui::Color32::from_rgb(92, 210, 210),
@@ -418,6 +1243,11 @@ fn text_format(highlight: Option<HighlightKind>) -> egui::TextFormat {
     egui::TextFormat {
         font_id: egui::FontId::monospace(13.0),
         color,
+        background: if node_highlight {
+            egui::Color32::from_rgba_unmultiplied(125, 190, 255, 88)
+        } else {
+            egui::Color32::TRANSPARENT
+        },
         ..default()
     }
 }
@@ -543,472 +1373,12 @@ fn is_number_token(text: &str) -> bool {
     matches!(chars.next(), Some(char) if char.is_ascii_digit())
 }
 
-fn add_node_button(ui: &mut egui::Ui, state: &mut EditorState, kind: NodeKind) -> bool {
-    let label = match &kind {
-        NodeKind::Constant(Value::F32(_)) => "Float Constant",
-        NodeKind::Constant(Value::Vec4(_)) => "Color Constant",
-        NodeKind::Uniform(Value::F32(_)) => "Float Uniform",
-        NodeKind::Uniform(Value::Vec4(_)) => "Color Uniform",
-        _ => kind.title(),
-    };
-
-    let clicked = ui.button(label).clicked();
-    if clicked {
-        spawn_node(state, kind);
-    }
-    clicked
-}
-
-fn spawn_node(state: &mut EditorState, kind: NodeKind) {
-    let id = NodeId(state.next_node_id);
-    state.next_node_id += 1;
-    let position = [90.0 + state.spawn_offset, 430.0 + state.spawn_offset * 0.35];
-    state.spawn_offset = (state.spawn_offset + 32.0) % 260.0;
-    state.graph.nodes.push(Node::new(id, kind, position));
-    state.selected = Some(id);
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct GraphEdit {
     source_changed: bool,
     preview_changed: bool,
     uniform_values_changed: bool,
-}
-
-fn draw_graph(ui: &mut egui::Ui, state: &mut EditorState) -> GraphEdit {
-    let canvas = ui.max_rect();
-    let painter = ui.painter_at(canvas);
-    painter.rect_filled(
-        canvas,
-        0.0,
-        egui::Color32::from_rgba_unmultiplied(8, 11, 18, 38),
-    );
-    draw_grid(&painter, canvas);
-
-    let node_size = egui::vec2(210.0, 124.0);
-    let origin = canvas.min + egui::vec2(24.0, 24.0);
-    let node_types = match &state.compilation {
-        Ok(compiled) => compiled.node_types.clone(),
-        Err(_) => HashMap::new(),
-    };
-
-    for target in &state.graph.nodes {
-        for (input_index, connection) in target.inputs.iter().enumerate() {
-            let Some(connection) = connection else {
-                continue;
-            };
-            let Some(source) = state.graph.node(connection.node) else {
-                continue;
-            };
-            let source_rect = node_rect(origin, node_size, source.position);
-            let target_rect = node_rect(origin, node_size, target.position);
-            let from = output_socket_position(source_rect);
-            let to = input_socket_position(target_rect, input_index);
-            let connection_type = output_type(source, &node_types);
-            painter.line_segment(
-                [from, to],
-                egui::Stroke::new(3.0, socket_color(connection_type)),
-            );
-        }
-    }
-    if let Some(source_id) = state.pending_connection
-        && let Some(source) = state.graph.node(source_id)
-        && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
-    {
-        let source_rect = node_rect(origin, node_size, source.position);
-        painter.line_segment(
-            [output_socket_position(source_rect), pointer],
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 196, 92)),
-        );
-    }
-
-    let mut graph_edit = GraphEdit::default();
-    let pointer_released = ui.input(|input| input.pointer.any_released());
-    let pointer_position = ui.input(|input| input.pointer.hover_pos());
-    for node in &mut state.graph.nodes {
-        let rect = node_rect(origin, node_size, node.position);
-        let header = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 34.0));
-        let response = ui.interact(
-            header,
-            egui::Id::new(("shader_node_header", node.id.0)),
-            egui::Sense::click_and_drag(),
-        );
-        if response.dragged() {
-            let delta = response.drag_delta();
-            node.position[0] += delta.x;
-            node.position[1] += delta.y;
-        }
-        if response.clicked() {
-            state.selected = Some(node.id);
-        }
-
-        let selected = state.selected == Some(node.id);
-        let border = if selected {
-            egui::Color32::from_rgb(255, 190, 80)
-        } else {
-            socket_color(output_type(node, &node_types))
-        };
-        painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(39, 45, 58));
-        painter.rect_stroke(
-            rect,
-            8.0,
-            egui::Stroke::new(if selected { 2.0 } else { 1.0 }, border),
-            egui::StrokeKind::Inside,
-        );
-        painter.rect_filled(
-            header,
-            egui::CornerRadius {
-                nw: 8,
-                ne: 8,
-                sw: 0,
-                se: 0,
-            },
-            node_header_color(output_type(node, &node_types)),
-        );
-        painter.text(
-            header.left_center() + egui::vec2(12.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            &node.name,
-            egui::FontId::proportional(16.0),
-            egui::Color32::WHITE,
-        );
-        let node_output_type = output_type(node, &node_types);
-        if node_output_type == Some(ShaderType::Vec4) {
-            let preview_rect = egui::Rect::from_min_size(
-                header.right_center() - egui::vec2(86.0, 10.0),
-                egui::vec2(20.0, 20.0),
-            );
-            let preview_response = ui.interact(
-                preview_rect,
-                egui::Id::new(("shader_node_preview", node.id.0)),
-                egui::Sense::click(),
-            );
-            if preview_response.clicked() {
-                state.preview_node = if state.preview_node == Some(node.id) {
-                    None
-                } else {
-                    Some(node.id)
-                };
-                graph_edit.preview_changed = true;
-            }
-
-            let active = state.preview_node == Some(node.id);
-            let preview_color = if active {
-                egui::Color32::from_rgb(255, 215, 110)
-            } else if preview_response.hovered() {
-                egui::Color32::from_rgb(255, 235, 165)
-            } else {
-                egui::Color32::from_rgb(150, 160, 175)
-            };
-            painter.circle_stroke(
-                preview_rect.center(),
-                8.0,
-                egui::Stroke::new(1.5, preview_color),
-            );
-            if active {
-                painter.circle_filled(preview_rect.center(), 4.0, preview_color);
-            }
-            preview_response.on_hover_text("Preview this vec4 node on the 3D object");
-        }
-        if let Some(shader_type) = node_output_type {
-            let badge_rect = egui::Rect::from_min_size(
-                header.right_center() - egui::vec2(58.0, 10.0),
-                egui::vec2(44.0, 20.0),
-            );
-            painter.rect_filled(
-                badge_rect,
-                10.0,
-                socket_color(Some(shader_type)).gamma_multiply(0.22),
-            );
-            painter.rect_stroke(
-                badge_rect,
-                10.0,
-                egui::Stroke::new(1.0, socket_color(Some(shader_type))),
-                egui::StrokeKind::Inside,
-            );
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                shader_type_label(shader_type),
-                egui::FontId::monospace(11.0),
-                egui::Color32::WHITE,
-            );
-        }
-        let content_rect = egui::Rect::from_min_max(
-            rect.left_top() + egui::vec2(12.0, 43.0),
-            rect.right_bottom() - egui::vec2(12.0, 10.0),
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .id_salt(("shader_node_content", node.id.0))
-                .max_rect(content_rect),
-            |ui| match &mut node.kind {
-                NodeKind::Constant(value) => {
-                    graph_edit.source_changed |= edit_constant(ui, value);
-                }
-                NodeKind::Uniform(value) => {
-                    graph_edit.uniform_values_changed |= edit_uniform(ui, value);
-                }
-                kind => {
-                    ui.label(
-                        egui::RichText::new(kind.title())
-                            .monospace()
-                            .color(egui::Color32::from_gray(190)),
-                    );
-                }
-            },
-        );
-        let output_position = output_socket_position(rect);
-        let output_response = ui.interact(
-            socket_rect(output_position),
-            egui::Id::new(("shader_node_output", node.id.0)),
-            egui::Sense::click_and_drag(),
-        );
-        if output_response.is_pointer_button_down_on() || output_response.drag_started() {
-            state.pending_connection = Some(node.id);
-        }
-        let output_color = if state.pending_connection == Some(node.id) {
-            egui::Color32::from_rgb(255, 196, 92)
-        } else if output_response.hovered() {
-            egui::Color32::from_rgb(145, 205, 255)
-        } else {
-            socket_color(node_output_type)
-        };
-        painter.circle_filled(output_position, 6.0, output_color);
-        if let Some(shader_type) = node_output_type {
-            painter.text(
-                output_position + egui::vec2(-10.0, 14.0),
-                egui::Align2::RIGHT_CENTER,
-                shader_type_label(shader_type),
-                egui::FontId::monospace(10.0),
-                socket_color(Some(shader_type)),
-            );
-        }
-        for input_index in 0..node.inputs.len() {
-            let input_position = input_socket_position(rect, input_index);
-            let input_response = ui.interact(
-                socket_rect(input_position),
-                egui::Id::new(("shader_node_input", node.id.0, input_index)),
-                egui::Sense::click(),
-            );
-            if input_response.secondary_clicked()
-                && let Some(input) = node.inputs.get_mut(input_index)
-            {
-                *input = None;
-                state.pending_connection = None;
-                graph_edit.source_changed = true;
-            }
-            let input_type = input_socket_type(node, input_index, &node_types);
-            let input_color = if input_response.hovered() && state.pending_connection.is_some() {
-                egui::Color32::from_rgb(255, 196, 92)
-            } else if input_response.hovered() {
-                egui::Color32::from_rgb(145, 205, 255)
-            } else {
-                socket_color(input_type)
-            };
-            painter.circle_filled(input_position, 6.0, input_color);
-            painter.text(
-                input_position + egui::vec2(10.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                input_socket_label(&node.kind, input_index),
-                egui::FontId::monospace(10.0),
-                input_color,
-            );
-        }
-    }
-
-    if pointer_released {
-        if let (Some(source_id), Some(pointer_position)) =
-            (state.pending_connection, pointer_position)
-            && let Some((target_id, input_index)) =
-                hovered_input_socket(&state.graph, origin, node_size, pointer_position)
-            && source_id != target_id
-            && let Some(target) = state
-                .graph
-                .nodes
-                .iter_mut()
-                .find(|node| node.id == target_id)
-        {
-            target.connect_input(input_index, source_id);
-            graph_edit.source_changed = true;
-        }
-        state.pending_connection = None;
-    }
-
-    graph_edit
-}
-
-fn hovered_input_socket(
-    graph: &ShaderGraph,
-    origin: egui::Pos2,
-    node_size: egui::Vec2,
-    pointer_position: egui::Pos2,
-) -> Option<(NodeId, usize)> {
-    graph.nodes.iter().find_map(|node| {
-        let rect = node_rect(origin, node_size, node.position);
-        (0..node.inputs.len()).find_map(|input_index| {
-            let input_position = input_socket_position(rect, input_index);
-            socket_rect(input_position)
-                .contains(pointer_position)
-                .then_some((node.id, input_index))
-        })
-    })
-}
-
-fn output_type(node: &Node, node_types: &HashMap<NodeId, ShaderType>) -> Option<ShaderType> {
-    node_types
-        .get(&node.id)
-        .copied()
-        .or_else(|| static_output_type(&node.kind))
-}
-
-fn static_output_type(kind: &NodeKind) -> Option<ShaderType> {
-    match kind {
-        NodeKind::Constant(value) | NodeKind::Uniform(value) => Some(value.shader_type()),
-        NodeKind::Uv => Some(ShaderType::Vec2),
-        NodeKind::Time => Some(ShaderType::F32),
-        NodeKind::TextureSample => Some(ShaderType::Vec4),
-        NodeKind::FragmentOutput => None,
-        NodeKind::Add
-        | NodeKind::Subtract
-        | NodeKind::Multiply
-        | NodeKind::Divide
-        | NodeKind::Sin
-        | NodeKind::Cos
-        | NodeKind::Abs
-        | NodeKind::Fract
-        | NodeKind::Normalize => None,
-    }
-}
-
-fn input_socket_type(
-    node: &Node,
-    input_index: usize,
-    node_types: &HashMap<NodeId, ShaderType>,
-) -> Option<ShaderType> {
-    node.inputs
-        .get(input_index)
-        .and_then(|connection| connection.as_ref())
-        .and_then(|connection| node_types.get(&connection.node).copied())
-        .or_else(|| static_input_type(&node.kind, input_index))
-}
-
-fn static_input_type(kind: &NodeKind, input_index: usize) -> Option<ShaderType> {
-    match (kind, input_index) {
-        (NodeKind::FragmentOutput, 0) => Some(ShaderType::Vec4),
-        (NodeKind::TextureSample, 0) => Some(ShaderType::Vec2),
-        _ => None,
-    }
-}
-
-fn input_socket_label(kind: &NodeKind, input_index: usize) -> &'static str {
-    match kind {
-        NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
-            if input_index == 0 { "A" } else { "B" }
-        }
-        NodeKind::FragmentOutput => "Color",
-        NodeKind::Sin | NodeKind::Cos | NodeKind::Abs | NodeKind::Fract | NodeKind::Normalize => {
-            "Value"
-        }
-        NodeKind::TextureSample => "UV",
-        _ => "",
-    }
-}
-
-fn socket_color(shader_type: Option<ShaderType>) -> egui::Color32 {
-    match shader_type {
-        Some(ShaderType::F32) => egui::Color32::from_rgb(245, 190, 90),
-        Some(ShaderType::Vec2) => egui::Color32::from_rgb(95, 210, 170),
-        Some(ShaderType::Vec3) => egui::Color32::from_rgb(95, 170, 255),
-        Some(ShaderType::Vec4) => egui::Color32::from_rgb(220, 115, 255),
-        None => egui::Color32::from_rgb(120, 135, 155),
-    }
-}
-
-fn node_header_color(shader_type: Option<ShaderType>) -> egui::Color32 {
-    let color = socket_color(shader_type);
-    egui::Color32::from_rgb(
-        (color.r() / 3).saturating_add(28),
-        (color.g() / 3).saturating_add(34),
-        (color.b() / 3).saturating_add(48),
-    )
-}
-
-fn shader_type_label(shader_type: ShaderType) -> &'static str {
-    match shader_type {
-        ShaderType::F32 => "f32",
-        ShaderType::Vec2 => "vec2",
-        ShaderType::Vec3 => "vec3",
-        ShaderType::Vec4 => "vec4",
-    }
-}
-
-fn edit_uniform(ui: &mut egui::Ui, value: &mut Value) -> bool {
-    ui.label("Preview value");
-    edit_constant(ui, value)
-}
-
-fn edit_constant(ui: &mut egui::Ui, value: &mut Value) -> bool {
-    match value {
-        Value::F32(value) => {
-            ui.horizontal(|ui| {
-                ui.label("Value");
-                ui.add(
-                    egui::DragValue::new(value)
-                        .speed(0.01)
-                        .max_decimals(4)
-                        .min_decimals(1),
-                )
-                .changed()
-            })
-            .inner
-        }
-        Value::Vec2(values) => edit_vector(ui, values, &["X", "Y"]),
-        Value::Vec3(values) => edit_vector(ui, values, &["X", "Y", "Z"]),
-        Value::Vec4(values) => {
-            ui.horizontal(|ui| {
-                ui.label("Color");
-                let mut color =
-                    egui::Rgba::from_rgba_unmultiplied(values[0], values[1], values[2], values[3]);
-                let changed = egui::widgets::color_picker::color_edit_button_rgba(
-                    ui,
-                    &mut color,
-                    egui::widgets::color_picker::Alpha::BlendOrAdditive,
-                )
-                .changed();
-                if changed {
-                    *values = color.to_array();
-                }
-                changed
-            })
-            .inner
-        }
-    }
-}
-
-fn edit_vector<const N: usize>(
-    ui: &mut egui::Ui,
-    values: &mut [f32; N],
-    labels: &[&str; N],
-) -> bool {
-    ui.vertical(|ui| {
-        let mut changed = false;
-        for (label, value) in labels.iter().zip(values.iter_mut()) {
-            ui.horizontal(|ui| {
-                ui.label(*label);
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(value)
-                            .speed(0.01)
-                            .max_decimals(4)
-                            .min_decimals(1),
-                    )
-                    .changed();
-            });
-        }
-        changed
-    })
-    .inner
+    position_changed: bool,
 }
 
 fn recompile_graph(
@@ -1019,10 +1389,29 @@ fn recompile_graph(
     state.compilation = compile_with_preview_node(&state.graph, state.preview_node)
         .map_err(|error| error.to_string());
     if let Ok(compiled) = &state.compilation {
-        if preview_shader.wesl != compiled.bevy_wesl {
+        if preview_shader.wesl != compiled.bevy_wesl || preview_shader.wgsl != compiled.bevy_wgsl {
             preview_shader.wesl.clone_from(&compiled.bevy_wesl);
+            preview_shader.wgsl.clone_from(&compiled.bevy_wgsl);
         }
         update_preview_uniforms(&state.graph, compiled, preview_uniforms);
+    }
+}
+
+fn apply_graph_editor_value_change(
+    editor: &mut ShaderGraphEditorState,
+    shader_node_id: NodeId,
+    value: Value,
+) {
+    for (_, node) in editor.graph.nodes.iter_mut() {
+        if node.user_data.shader_id == shader_node_id {
+            match &mut node.user_data.kind {
+                NodeKind::Constant(current) | NodeKind::Uniform(current) => {
+                    *current = value;
+                }
+                _ => {}
+            }
+            break;
+        }
     }
 }
 
@@ -1063,39 +1452,37 @@ fn value_to_array(value: &Value) -> [f32; 4] {
     }
 }
 
-fn node_rect(origin: egui::Pos2, size: egui::Vec2, position: [f32; 2]) -> egui::Rect {
-    egui::Rect::from_min_size(origin + egui::vec2(position[0], position[1]), size)
+fn load_texture_image(path: &str, images: &mut Assets<Image>) -> Result<Handle<Image>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let (width, height) = img.dimensions();
+    let rgba = img.to_rgba8().into_raw();
+    let image = Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    Ok(images.add(image))
 }
 
-fn output_socket_position(rect: egui::Rect) -> egui::Pos2 {
-    rect.right_center()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn input_socket_position(rect: egui::Rect, input_index: usize) -> egui::Pos2 {
-    egui::pos2(rect.left(), rect.top() + 52.0 + input_index as f32 * 22.0)
-}
-
-fn socket_rect(position: egui::Pos2) -> egui::Rect {
-    egui::Rect::from_center_size(position, egui::Vec2::splat(18.0))
-}
-
-fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
-    let spacing = 24.0;
-    let color = egui::Color32::from_rgba_unmultiplied(185, 205, 235, 24);
-    let mut x = rect.left();
-    while x < rect.right() {
-        painter.line_segment(
-            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, color),
+    #[test]
+    fn module_names_are_sanitized_for_storage() {
+        assert_eq!(sanitized_module_display_name("", 3), "Module 3");
+        assert_eq!(
+            sanitized_module_display_name("  Fancy Noise  ", 1),
+            "Fancy Noise"
         );
-        x += spacing;
-    }
-    let mut y = rect.top();
-    while y < rect.bottom() {
-        painter.line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, color),
-        );
-        y += spacing;
+        assert_eq!(module_file_stem("Fancy Noise!"), "fancy_noise");
+        assert_eq!(module_file_stem("???"), "module");
     }
 }

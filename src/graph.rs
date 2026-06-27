@@ -53,9 +53,28 @@ impl Value {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModulePort {
+    pub name: String,
+    pub shader_type: ShaderType,
+    pub node: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModuleDefinition {
+    pub id: u64,
+    pub name: String,
+    pub root: NodeId,
+    pub nodes: Vec<NodeId>,
+    pub inputs: Vec<ModulePort>,
+    pub output: ModulePort,
+    pub graph: Box<ShaderGraph>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
     Constant(Value),
     Uniform(Value),
+    Module(Box<ModuleDefinition>),
     Uv,
     Time,
     Add,
@@ -67,6 +86,30 @@ pub enum NodeKind {
     Abs,
     Fract,
     Normalize,
+    LygiaRandom,
+    LygiaValueNoise,
+    LygiaFbm,
+    LygiaVoronoi,
+    LygiaPow2,
+    LygiaPow3,
+    LygiaSaturate,
+    LygiaCenter,
+    LygiaUncenter,
+    LygiaScale2d,
+    LygiaRotate2d,
+    LygiaCircleSdf,
+    LygiaRectSdf,
+    LygiaBoxSdf,
+    LygiaLuma,
+    LygiaInvert,
+    LygiaBrightness,
+    LygiaContrast,
+    LygiaPosterize,
+    LygiaSaturation,
+    LygiaGammaCorrect,
+    LygiaBlendScreen,
+    LygiaBlendOverlay,
+    LygiaCosinePalette,
     TextureSample,
     FragmentOutput,
 }
@@ -76,6 +119,7 @@ impl NodeKind {
         match self {
             Self::Constant(_) => "Constant",
             Self::Uniform(_) => "Uniform",
+            Self::Module(_) => "Module",
             Self::Uv => "UV",
             Self::Time => "Time",
             Self::Add => "Add",
@@ -87,6 +131,30 @@ impl NodeKind {
             Self::Abs => "Absolute",
             Self::Fract => "Fract",
             Self::Normalize => "Normalize",
+            Self::LygiaRandom => "LYGIA Random",
+            Self::LygiaValueNoise => "LYGIA Value Noise",
+            Self::LygiaFbm => "LYGIA FBM",
+            Self::LygiaVoronoi => "LYGIA Voronoi",
+            Self::LygiaPow2 => "LYGIA Pow2",
+            Self::LygiaPow3 => "LYGIA Pow3",
+            Self::LygiaSaturate => "LYGIA Saturate",
+            Self::LygiaCenter => "LYGIA Center",
+            Self::LygiaUncenter => "LYGIA Uncenter",
+            Self::LygiaScale2d => "LYGIA Scale 2D",
+            Self::LygiaRotate2d => "LYGIA Rotate 2D",
+            Self::LygiaCircleSdf => "LYGIA Circle SDF",
+            Self::LygiaRectSdf => "LYGIA Rect SDF",
+            Self::LygiaBoxSdf => "LYGIA Box SDF",
+            Self::LygiaLuma => "LYGIA Luma",
+            Self::LygiaInvert => "LYGIA Invert",
+            Self::LygiaBrightness => "LYGIA Brightness",
+            Self::LygiaContrast => "LYGIA Contrast",
+            Self::LygiaPosterize => "LYGIA Posterize",
+            Self::LygiaSaturation => "LYGIA Saturation",
+            Self::LygiaGammaCorrect => "LYGIA Gamma Correct",
+            Self::LygiaBlendScreen => "LYGIA Blend Screen",
+            Self::LygiaBlendOverlay => "LYGIA Blend Overlay",
+            Self::LygiaCosinePalette => "LYGIA Cosine Palette",
             Self::TextureSample => "Texture Sample",
             Self::FragmentOutput => "Fragment Output",
         }
@@ -95,14 +163,42 @@ impl NodeKind {
     pub fn input_count(&self) -> usize {
         match self {
             Self::Constant(_) | Self::Uniform(_) | Self::Uv | Self::Time => 0,
+            Self::Module(module) => module.inputs.len(),
             Self::Sin
             | Self::Cos
             | Self::Abs
             | Self::Fract
             | Self::Normalize
+            | Self::LygiaRandom
+            | Self::LygiaValueNoise
+            | Self::LygiaFbm
+            | Self::LygiaPow2
+            | Self::LygiaPow3
+            | Self::LygiaSaturate
+            | Self::LygiaCenter
+            | Self::LygiaUncenter
+            | Self::LygiaLuma
+            | Self::LygiaInvert
+            | Self::LygiaCosinePalette
             | Self::FragmentOutput
             | Self::TextureSample => 1,
-            Self::Add | Self::Subtract | Self::Multiply | Self::Divide => 2,
+            Self::Add
+            | Self::Subtract
+            | Self::Multiply
+            | Self::Divide
+            | Self::LygiaVoronoi
+            | Self::LygiaScale2d
+            | Self::LygiaRotate2d
+            | Self::LygiaCircleSdf
+            | Self::LygiaRectSdf
+            | Self::LygiaBoxSdf
+            | Self::LygiaBrightness
+            | Self::LygiaContrast
+            | Self::LygiaPosterize
+            | Self::LygiaSaturation
+            | Self::LygiaGammaCorrect
+            | Self::LygiaBlendScreen
+            | Self::LygiaBlendOverlay => 2,
         }
     }
 }

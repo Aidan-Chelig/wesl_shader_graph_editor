@@ -29,8 +29,10 @@ bevy = { version = "0.19.0", default-features = true, features = [
   "wayland",
 ] }
 bevy_egui = "0.40.1"
+egui-graph-edit = { path = "vendor/egui-graph-edit" }
 
 clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
 naga = { version = "29.0.3", features = ["wgsl-in"] }
 ron = "0.12"
 rfd = "0.17"

@@ -1,10 +1,12 @@
 use bevy::{
-    asset::{uuid_handle, RenderAssetUsages},
+    asset::{RenderAssetUsages, uuid_handle},
     pbr::Material,
     prelude::*,
     reflect::TypePath,
     render::{
-        render_resource::{AsBindGroup, Extent3d, Face, ShaderType, TextureDimension, TextureFormat},
+        render_resource::{
+            AsBindGroup, Extent3d, Face, ShaderType, TextureDimension, TextureFormat,
+        },
         storage::ShaderBuffer,
     },
     shader::{Shader, ShaderRef},
@@ -20,6 +22,7 @@ impl Plugin for PreviewPlugin {
         app.init_resource::<PreviewSettings>()
             .init_resource::<PreviewShaderSource>()
             .init_resource::<PreviewUniformValues>()
+            .init_resource::<PreviewTexture>()
             .add_plugins(MaterialPlugin::<GraphMaterial>::default())
             .add_systems(Startup, setup_preview)
             .add_systems(
@@ -28,6 +31,7 @@ impl Plugin for PreviewPlugin {
                     apply_preview_primitive,
                     advance_preview_time,
                     apply_preview_uniforms,
+                    apply_preview_texture,
                     update_preview_shader,
                     animate_preview,
                 ),
@@ -73,6 +77,7 @@ impl Default for PreviewSettings {
 #[derive(Resource, Clone, Debug)]
 pub struct PreviewShaderSource {
     pub wesl: String,
+    pub wgsl: String,
 }
 
 impl Default for PreviewShaderSource {
@@ -80,6 +85,7 @@ impl Default for PreviewShaderSource {
         let compiled = compile(&ShaderGraph::example()).expect("example graph must compile");
         Self {
             wesl: compiled.bevy_wesl,
+            wgsl: compiled.bevy_wgsl,
         }
     }
 }
@@ -117,7 +123,7 @@ impl PreviewMeshes {
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-struct GraphMaterial {
+pub(crate) struct GraphMaterial {
     #[uniform(0)]
     uniforms: GraphUniforms,
     #[storage(1, read_only)]
@@ -153,10 +159,16 @@ struct PreviewObject;
 struct PreviewMesh;
 
 #[derive(Resource)]
-struct PreviewGraphMaterial(Handle<GraphMaterial>);
+pub struct PreviewGraphMaterial(pub Handle<GraphMaterial>);
 
 #[derive(Resource)]
-struct PreviewUniformBuffer(Handle<ShaderBuffer>);
+pub struct PreviewUniformBuffer(Handle<ShaderBuffer>);
+
+#[derive(Resource, Clone, Debug, Default)]
+pub struct PreviewTexture {
+    pub handle: Handle<Image>,
+    pub path: Option<String>,
+}
 
 fn setup_preview(
     mut commands: Commands,
@@ -173,7 +185,7 @@ fn setup_preview(
     shaders
         .insert(
             GRAPH_SHADER_HANDLE.id(),
-            Shader::from_wesl(source.wesl.clone(), "generated/preview.wesl"),
+            Shader::from_wgsl(source.wgsl.clone(), "generated/preview.wgsl"),
         )
         .expect("UUID shader handles are always insertable");
 
@@ -228,6 +240,10 @@ fn setup_preview(
     commands.insert_resource(preview_meshes);
     commands.insert_resource(PreviewGraphMaterial(graph_material));
     commands.insert_resource(PreviewUniformBuffer(user_uniforms));
+    commands.insert_resource(PreviewTexture {
+        handle: graph_texture,
+        path: None,
+    });
 }
 
 fn apply_preview_primitive(
@@ -251,7 +267,7 @@ fn update_preview_shader(source: Res<PreviewShaderSource>, mut shaders: ResMut<A
     shaders
         .insert(
             GRAPH_SHADER_HANDLE.id(),
-            Shader::from_wesl(source.wesl.clone(), "generated/preview.wesl"),
+            Shader::from_wgsl(source.wgsl.clone(), "generated/preview.wgsl"),
         )
         .expect("UUID shader handles are always insertable");
 }
@@ -265,6 +281,20 @@ fn advance_preview_time(
         return;
     };
     material.uniforms = GraphUniforms::from_seconds(time.elapsed_secs());
+}
+
+fn apply_preview_texture(
+    texture: Res<PreviewTexture>,
+    material: Res<PreviewGraphMaterial>,
+    mut materials: ResMut<Assets<GraphMaterial>>,
+) {
+    if !texture.is_changed() {
+        return;
+    }
+    let Some(mut mat) = materials.get_mut(&material.0) else {
+        return;
+    };
+    mat.graph_texture = texture.handle.clone();
 }
 
 fn apply_preview_uniforms(
@@ -306,7 +336,11 @@ fn create_checker_texture() -> Image {
         }
     }
     Image::new(
-        Extent3d { width, height, depth_or_array_layers: 1 },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         data,
         TextureFormat::Rgba8Unorm,

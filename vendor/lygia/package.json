@@ -1,0 +1,101 @@
+{
+  "name": "lygia",
+  "version": "1.4.1",
+  "description": "lygia, it's a granular and multi-language shader library designed for performance and flexibility",
+  "main": "dist/umd/lygia.main.js",
+  "unpkg": "dist/umd/lygia.main.js",
+  "jsdelivr": "dist/umd/lygia.main.js",
+  "module": "dist/module/lygia.main.js",
+  "type": "module",
+  "scripts": {
+    "build": "rm -rf dist/* && webpack",
+    "build:wesl": "wesl-packager --multiBundle --outDir dist",
+    "ci:check": "pnpm test:once && pnpm test:built",
+    "lint": "eslint --fix --ext .js .",
+    "prepublishOnly": "pnpm build:wesl",
+    "test": "pnpm vitest",
+    "test:built": "pnpm build:wesl && TEST_BUNDLES=true pnpm vitest run && TEST_BUNDLES=true wgsl-test run",
+    "test:deno": "pnpm test:deno:vitest && pnpm test:deno:native",
+    "test:deno:vitest": "deno run -A --unstable-webgpu npm:vitest run",
+    "test:deno:native": "deno run -A --unstable-webgpu npm:wgsl-test run",
+    "test:native": "wgsl-test run",
+    "test:native:built": "pnpm build:wesl && TEST_BUNDLES=true wgsl-test run",
+    "test:once": "pnpm vitest run && wgsl-test run",
+    "snapshot:push": "cd test/wesl/__image_snapshots__ && git add -A && git diff --cached --quiet || git commit -m 'update snapshots' && git push origin HEAD:main"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patriciogonzalezvivo/lygia.git"
+  },
+  "keywords": [
+    "library",
+    "computer-graphics",
+    "shader",
+    "shader-library",
+    "glsl",
+    "wgsl",
+    "WESL",
+    "WebGPU",
+    "hlsl",
+    "metal",
+    "glsl-shader",
+    "hlsl-shader",
+    "wgsl-shader",
+    "metal-shader"
+  ],
+  "author": "Patricio Gonzalez Vivo",
+  "license": "Prosperity License & Patron License (https://lygia.xyz/license)",
+  "bugs": {
+    "url": "https://github.com/patriciogonzalezvivo/lygia/issues"
+  },
+  "homepage": "https://lygia.xyz",
+  "devDependencies": {
+    "@typescript/native-preview": "7.0.0-dev.20260320.1",
+    "@webgpu/types": "^0.1.69",
+    "eslint": "^10.1.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.5",
+    "prettier": "^3.8.1",
+    "vite": "^8.0.1",
+    "vitest": "^4.1.0",
+    "vitest-image-snapshot": "^0.6.47",
+    "webpack": "^5.105.4",
+    "webpack-cli": "^7.0.2",
+    "webpack-glsl-loader": "github:patriciogonzalezvivo/webpack-glsl-loader",
+    "wesl-link": "^0.7.21",
+    "wesl-packager": "^0.7.21",
+    "wgsl-test": "^0.2.26"
+  },
+  "eslintConfig": {
+    "env": {
+      "browser": true,
+      "node": true,
+      "es6": true
+    },
+    "extends": [
+      "prettier"
+    ],
+    "plugins": [
+      "prettier"
+    ],
+    "rules": {
+      "prettier/prettier": [
+        "error"
+      ]
+    },
+    "parserOptions": {
+      "sourceType": "module"
+    }
+  },
+  "prettier": {
+    "semi": false,
+    "arrowParens": "always",
+    "singleQuote": true
+  },
+  "exports": {
+    "./*": {
+      "import": "./dist/*/weslBundle.js",
+      "types": "./dist/weslBundle.d.ts"
+    }
+  }
+}
