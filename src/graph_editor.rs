@@ -457,6 +457,7 @@ pub enum GraphNodeTemplate {
     LygiaBlendOverlay,
     LygiaCosinePalette,
     TextureSample,
+    FragmentOutput,
 }
 
 impl GraphNodeTemplate {
@@ -553,6 +554,7 @@ impl GraphNodeTemplate {
             Self::LygiaBlendOverlay => NodeKind::LygiaBlendOverlay,
             Self::LygiaCosinePalette => NodeKind::LygiaCosinePalette,
             Self::TextureSample => NodeKind::TextureSample,
+            Self::FragmentOutput => NodeKind::FragmentOutput,
         }
     }
 
@@ -635,6 +637,7 @@ impl NodeTemplateIter for GraphNodeTemplates {
             GraphNodeTemplate::LygiaBlendOverlay,
             GraphNodeTemplate::LygiaCosinePalette,
             GraphNodeTemplate::TextureSample,
+            GraphNodeTemplate::FragmentOutput,
         ];
         if let Some(filter) = self.filter {
             templates
@@ -699,6 +702,7 @@ pub fn template_label(template: &GraphNodeTemplate) -> &'static str {
         GraphNodeTemplate::Vec2Uniform => "vec2 Uniform",
         GraphNodeTemplate::Vec3Uniform => "vec3 Uniform",
         GraphNodeTemplate::Vec4Uniform => "vec4 Uniform",
+        GraphNodeTemplate::FragmentOutput => "Fragment Output",
         _ => template.kind().title(),
     }
 }
@@ -748,6 +752,7 @@ fn template_category(template: &GraphNodeTemplate) -> &'static str {
         | GraphNodeTemplate::LygiaBlendOverlay
         | GraphNodeTemplate::LygiaCosinePalette => "09 LYGIA Color",
         GraphNodeTemplate::TextureSample => "10 Textures",
+        GraphNodeTemplate::FragmentOutput => "11 Outputs",
     }
 }
 
