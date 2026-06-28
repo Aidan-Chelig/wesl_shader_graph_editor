@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use bevy_egui::egui;
 use egui_graph_edit::{
-    AnyParameterId, CategoryTrait, DataTypeTrait, Graph, GraphEditorState, InputParamKind,
+    AnyParameterId, CategoryTrait, DataTypeTrait, Graph, GraphEditorState, InputId, InputParamKind,
     NodeDataTrait, NodeId, NodeResponse, NodeTemplateIter, NodeTemplateTrait, UserResponseTrait,
     WidgetValueTrait,
 };
@@ -20,6 +20,7 @@ pub struct GraphUiState {
     pub preview_node: Option<ShaderNodeId>,
     pub texture_path: Option<String>,
     pub connection_context: Option<ConnectionContext>,
+    pub conflict_nodes: Vec<ShaderNodeId>,
     pub value_changed: bool,
     pub preview_changed: bool,
 }
@@ -31,6 +32,7 @@ impl GraphUiState {
             preview_node: None,
             texture_path: None,
             connection_context: None,
+            conflict_nodes: Vec::new(),
             value_changed: false,
             preview_changed: false,
         }
@@ -53,6 +55,12 @@ impl ConnectionContext {
     fn needs_template_input(self) -> bool {
         matches!(self.origin, AnyParameterId::Output(_))
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphTypeConflict {
+    pub message: String,
+    pub nodes: Vec<ShaderNodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +108,16 @@ impl GraphDataType {
             ShaderType::Vec2 => Self::Vec2,
             ShaderType::Vec3 => Self::Vec3,
             ShaderType::Vec4 => Self::Vec4,
+        }
+    }
+
+    fn shader_type(self) -> Option<ShaderType> {
+        match self {
+            Self::F32 => Some(ShaderType::F32),
+            Self::Vec2 => Some(ShaderType::Vec2),
+            Self::Vec3 => Some(ShaderType::Vec3),
+            Self::Vec4 => Some(ShaderType::Vec4),
+            Self::Any => None,
         }
     }
 
@@ -158,6 +176,387 @@ impl GraphDataType {
             | NodeKind::LygiaBlendOverlay => Some(Self::Any),
             NodeKind::TextureSample => Some(Self::Vec4),
         }
+    }
+}
+
+pub fn resolve_ambiguous_output_types(editor: &mut ShaderGraphEditorState) {
+    let max_passes = editor.graph.nodes.len().saturating_add(1);
+    for _ in 0..max_passes {
+        let mut changed = false;
+        let node_ids = editor.graph.iter_nodes().collect::<Vec<_>>();
+        for node_id in node_ids {
+            changed |= resolve_ambiguous_node_output_type(editor, node_id);
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+pub fn resolve_ambiguous_output_types_checked(
+    editor: &mut ShaderGraphEditorState,
+) -> Result<(), GraphTypeConflict> {
+    let connections = editor.graph.iter_connections().collect::<Vec<_>>();
+    resolve_ambiguous_output_types(editor);
+
+    if let Some((input, output)) = connections.into_iter().find(|connection| {
+        !editor
+            .graph
+            .iter_connections()
+            .any(|current| current == *connection)
+    }) {
+        return Err(broken_connection_message(editor, input, output));
+    }
+
+    if let Some(error) = ambiguous_node_type_error(editor) {
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn broken_connection_message(
+    editor: &ShaderGraphEditorState,
+    input: InputId,
+    output: egui_graph_edit::OutputId,
+) -> GraphTypeConflict {
+    let source = editor
+        .graph
+        .outputs
+        .get(output)
+        .and_then(|output_param| editor.graph.nodes.get(output_param.node))
+        .map(|node| node.label.as_str())
+        .unwrap_or("source");
+    let target = editor
+        .graph
+        .inputs
+        .get(input)
+        .and_then(|input_param| editor.graph.nodes.get(input_param.node))
+        .map(|node| node.label.as_str())
+        .unwrap_or("target");
+    let input_name = editor
+        .graph
+        .inputs
+        .get(input)
+        .and_then(|input_param| {
+            editor
+                .graph
+                .nodes
+                .get(input_param.node)?
+                .inputs
+                .iter()
+                .find_map(|(name, candidate)| (*candidate == input).then_some(name.as_str()))
+        })
+        .unwrap_or("input");
+
+    GraphTypeConflict {
+        message: format!(
+            "Connection rejected: changing this type would break {source} -> {target}.{input_name}"
+        ),
+        nodes: connection_shader_nodes(editor, input, output),
+    }
+}
+
+fn ambiguous_node_type_error(editor: &ShaderGraphEditorState) -> Option<GraphTypeConflict> {
+    for node_id in editor.graph.iter_nodes() {
+        let node = editor.graph.nodes.get(node_id)?;
+        let error = match node.user_data.kind {
+            NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
+                let left = connected_input_type(editor, node_id, 0);
+                let right = connected_input_type(editor, node_id, 1);
+                match (left, right) {
+                    (Some(left), Some(right))
+                        if binary_graph_result_type(left, right).is_none() =>
+                    {
+                        Some(format!(
+                            "{} cannot combine {} with {}",
+                            node.label,
+                            graph_type_label(left),
+                            graph_type_label(right)
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            NodeKind::Normalize => connected_input_type(editor, node_id, 0).and_then(|input| {
+                (input == GraphDataType::F32).then(|| {
+                    format!(
+                        "{} cannot normalize {}",
+                        node.label,
+                        graph_type_label(input)
+                    )
+                })
+            }),
+            NodeKind::LygiaCenter | NodeKind::LygiaUncenter => {
+                connected_input_type(editor, node_id, 0).and_then(|input| {
+                    (input == GraphDataType::Vec4).then(|| {
+                        format!(
+                            "{} does not support {}",
+                            node.label,
+                            graph_type_label(input)
+                        )
+                    })
+                })
+            }
+            NodeKind::LygiaInvert
+            | NodeKind::LygiaBrightness
+            | NodeKind::LygiaContrast
+            | NodeKind::LygiaPosterize
+            | NodeKind::LygiaSaturation
+            | NodeKind::LygiaGammaCorrect => {
+                connected_input_type(editor, node_id, 0).and_then(|input| {
+                    (!matches!(input, GraphDataType::Vec3 | GraphDataType::Vec4)).then(|| {
+                        format!(
+                            "{} requires vec3 or vec4 color input, got {}",
+                            node.label,
+                            graph_type_label(input)
+                        )
+                    })
+                })
+            }
+            NodeKind::LygiaBlendScreen | NodeKind::LygiaBlendOverlay => {
+                let base = connected_input_type(editor, node_id, 0);
+                let blend = connected_input_type(editor, node_id, 1);
+                [("base", base), ("blend", blend)]
+                    .into_iter()
+                    .find_map(|(label, input)| {
+                        let input = input?;
+                        (!matches!(input, GraphDataType::Vec3 | GraphDataType::Vec4)).then(|| {
+                            format!(
+                                "{} requires vec3 or vec4 {label} input, got {}",
+                                node.label,
+                                graph_type_label(input)
+                            )
+                        })
+                    })
+            }
+            _ => None,
+        };
+
+        if let Some(error) = error {
+            return Some(GraphTypeConflict {
+                message: format!("Connection rejected: {error}"),
+                nodes: vec![node.user_data.shader_id],
+            });
+        }
+    }
+
+    None
+}
+
+fn connection_shader_nodes(
+    editor: &ShaderGraphEditorState,
+    input: InputId,
+    output: egui_graph_edit::OutputId,
+) -> Vec<ShaderNodeId> {
+    let mut nodes = Vec::new();
+    if let Some(source) = editor
+        .graph
+        .outputs
+        .get(output)
+        .and_then(|output_param| editor.graph.nodes.get(output_param.node))
+    {
+        nodes.push(source.user_data.shader_id);
+    }
+    if let Some(target) = editor
+        .graph
+        .inputs
+        .get(input)
+        .and_then(|input_param| editor.graph.nodes.get(input_param.node))
+    {
+        nodes.push(target.user_data.shader_id);
+    }
+    nodes
+}
+
+fn graph_type_label(data_type: GraphDataType) -> &'static str {
+    match data_type {
+        GraphDataType::Any => "value",
+        GraphDataType::F32 => "f32",
+        GraphDataType::Vec2 => "vec2",
+        GraphDataType::Vec3 => "vec3",
+        GraphDataType::Vec4 => "vec4",
+    }
+}
+
+fn resolve_ambiguous_node_output_type(
+    editor: &mut ShaderGraphEditorState,
+    node_id: NodeId,
+) -> bool {
+    let Some(node) = editor.graph.nodes.get(node_id) else {
+        return false;
+    };
+    if GraphDataType::output_for_kind(&node.user_data.kind) != Some(GraphDataType::Any) {
+        return false;
+    }
+    let Some(output_id) = node.outputs.first().map(|(_, output)| *output) else {
+        return false;
+    };
+
+    let resolved = resolved_output_type(editor, node_id).unwrap_or(GraphDataType::Any);
+    let current = editor.graph.outputs[output_id].typ;
+    if current.same_exact_type(resolved) {
+        return false;
+    }
+
+    editor
+        .graph
+        .update_output_param(output_id, None, Some(resolved));
+    true
+}
+
+fn resolved_output_type(editor: &ShaderGraphEditorState, node_id: NodeId) -> Option<GraphDataType> {
+    let node = editor.graph.nodes.get(node_id)?;
+    output_type_from_inputs(editor, node_id).or_else(|| {
+        node.outputs
+            .first()
+            .map(|(_, output)| output_type_from_consumers(editor, *output))
+            .unwrap_or(None)
+    })
+}
+
+fn output_type_from_inputs(
+    editor: &ShaderGraphEditorState,
+    node_id: NodeId,
+) -> Option<GraphDataType> {
+    let node = editor.graph.nodes.get(node_id)?;
+    let kind = &node.user_data.kind;
+
+    match kind {
+        NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
+            let left = connected_input_type(editor, node_id, 0);
+            let right = connected_input_type(editor, node_id, 1);
+            match (left, right) {
+                (Some(left), Some(right)) => binary_graph_result_type(left, right),
+                (Some(ty), None) | (None, Some(ty)) => binary_partial_graph_result_type(ty),
+                (None, None) => None,
+            }
+        }
+        NodeKind::Sin
+        | NodeKind::Cos
+        | NodeKind::Abs
+        | NodeKind::Fract
+        | NodeKind::Normalize
+        | NodeKind::LygiaPow2
+        | NodeKind::LygiaPow3
+        | NodeKind::LygiaSaturate
+        | NodeKind::LygiaCenter
+        | NodeKind::LygiaUncenter
+        | NodeKind::LygiaInvert
+        | NodeKind::LygiaBrightness
+        | NodeKind::LygiaContrast
+        | NodeKind::LygiaPosterize
+        | NodeKind::LygiaSaturation
+        | NodeKind::LygiaGammaCorrect
+        | NodeKind::LygiaBlendScreen
+        | NodeKind::LygiaBlendOverlay => connected_input_type(editor, node_id, 0),
+        _ => None,
+    }
+}
+
+fn connected_input_type(
+    editor: &ShaderGraphEditorState,
+    node_id: NodeId,
+    input_index: usize,
+) -> Option<GraphDataType> {
+    let input_id = editor.graph.nodes.get(node_id)?.inputs.get(input_index)?.1;
+    let output_id = editor.graph.connection(input_id)?;
+    let output_type = editor.graph.outputs.get(output_id)?.typ;
+    output_type
+        .shader_type()
+        .map(GraphDataType::from_shader_type)
+}
+
+fn output_type_from_consumers(
+    editor: &ShaderGraphEditorState,
+    output_id: egui_graph_edit::OutputId,
+) -> Option<GraphDataType> {
+    editor
+        .graph
+        .iter_connections()
+        .filter_map(|(input, output)| (output == output_id).then_some(input))
+        .find_map(|input| input_type_constraint(editor, input))
+}
+
+fn input_type_constraint(
+    editor: &ShaderGraphEditorState,
+    input_id: InputId,
+) -> Option<GraphDataType> {
+    let input = editor.graph.inputs.get(input_id)?;
+    input
+        .typ
+        .shader_type()
+        .map(GraphDataType::from_shader_type)
+        .or_else(|| {
+            let input_node = editor.graph.nodes.get(input.node)?;
+            let input_index = input_node
+                .inputs
+                .iter()
+                .position(|(_, candidate)| *candidate == input_id)?;
+            input_constraint_from_node_output(editor, input.node, input_index)
+        })
+}
+
+fn input_constraint_from_node_output(
+    editor: &ShaderGraphEditorState,
+    node_id: NodeId,
+    input_index: usize,
+) -> Option<GraphDataType> {
+    let node = editor.graph.nodes.get(node_id)?;
+    let output_id = node.outputs.first()?.1;
+    let output_type = editor.graph.outputs.get(output_id)?.typ;
+    let output_type = output_type
+        .shader_type()
+        .map(GraphDataType::from_shader_type)?;
+
+    match node.user_data.kind {
+        NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
+            let other = if input_index == 0 { 1 } else { 0 };
+            connected_input_type(editor, node_id, other)
+                .and_then(|other_type| binary_graph_result_type(output_type, other_type))
+                .or(Some(output_type))
+        }
+        NodeKind::Sin
+        | NodeKind::Cos
+        | NodeKind::Abs
+        | NodeKind::Fract
+        | NodeKind::Normalize
+        | NodeKind::LygiaPow2
+        | NodeKind::LygiaPow3
+        | NodeKind::LygiaSaturate
+        | NodeKind::LygiaCenter
+        | NodeKind::LygiaUncenter
+        | NodeKind::LygiaInvert
+        | NodeKind::LygiaBrightness
+        | NodeKind::LygiaContrast
+        | NodeKind::LygiaPosterize
+        | NodeKind::LygiaSaturation
+        | NodeKind::LygiaGammaCorrect
+        | NodeKind::LygiaBlendScreen
+        | NodeKind::LygiaBlendOverlay => (input_index == 0).then_some(output_type),
+        _ => None,
+    }
+}
+
+fn binary_graph_result_type(left: GraphDataType, right: GraphDataType) -> Option<GraphDataType> {
+    let left = left.shader_type()?;
+    let right = right.shader_type()?;
+    if left == right {
+        Some(GraphDataType::from_shader_type(left))
+    } else if left == ShaderType::F32 {
+        Some(GraphDataType::from_shader_type(right))
+    } else if right == ShaderType::F32 {
+        Some(GraphDataType::from_shader_type(left))
+    } else {
+        None
+    }
+}
+
+fn binary_partial_graph_result_type(input: GraphDataType) -> Option<GraphDataType> {
+    if input == GraphDataType::F32 {
+        None
+    } else {
+        Some(input)
     }
 }
 
@@ -306,18 +705,20 @@ impl NodeDataTrait for GraphNodeData {
     fn top_bar_ui(
         &self,
         ui: &mut egui::Ui,
-        _node_id: NodeId,
-        _graph: &Graph<Self, Self::DataType, Self::ValueType>,
+        node_id: NodeId,
+        graph: &Graph<Self, Self::DataType, Self::ValueType>,
         user_state: &mut Self::UserState,
     ) -> Vec<NodeResponse<Self::Response, Self>> {
         let mut responses = Vec::new();
         ui.push_id(("top", self.shader_id.0), |ui| {
-            if GraphDataType::output_for_kind(&self.kind) == Some(GraphDataType::Vec4) {
+            if let Some(output_type) = resolved_node_output_port_type(graph, node_id)
+                && preview_supported_type(output_type)
+            {
                 let active = user_state.preview_node == Some(self.shader_id);
                 let label = if active { "◉" } else { "○" };
                 if ui
                     .small_button(label)
-                    .on_hover_text("Preview this vec4 node")
+                    .on_hover_text("Preview this f32, vec3, or vec4 node")
                     .clicked()
                 {
                     user_state.preview_node = if active { None } else { Some(self.shader_id) };
@@ -332,17 +733,36 @@ impl NodeDataTrait for GraphNodeData {
     fn titlebar_color(
         &self,
         _ui: &egui::Ui,
-        _node_id: NodeId,
-        _graph: &Graph<Self, Self::DataType, Self::ValueType>,
-        _user_state: &mut Self::UserState,
+        node_id: NodeId,
+        graph: &Graph<Self, Self::DataType, Self::ValueType>,
+        user_state: &mut Self::UserState,
     ) -> Option<egui::Color32> {
-        let color = GraphDataType::output_for_kind(&self.kind)?.data_type_color(_user_state);
+        if user_state.conflict_nodes.contains(&self.shader_id) {
+            return Some(egui::Color32::from_rgb(130, 38, 48));
+        }
+
+        let color = resolved_node_output_port_type(graph, node_id)?.data_type_color(user_state);
         Some(egui::Color32::from_rgb(
             (color.r() / 3).saturating_add(28),
             (color.g() / 3).saturating_add(34),
             (color.b() / 3).saturating_add(48),
         ))
     }
+}
+
+fn resolved_node_output_port_type(
+    graph: &Graph<GraphNodeData, GraphDataType, GraphValue>,
+    node_id: NodeId,
+) -> Option<GraphDataType> {
+    let output_id = graph.nodes.get(node_id)?.outputs.first()?.1;
+    Some(graph.outputs.get(output_id)?.typ)
+}
+
+fn preview_supported_type(output_type: GraphDataType) -> bool {
+    matches!(
+        output_type,
+        GraphDataType::F32 | GraphDataType::Vec3 | GraphDataType::Vec4
+    )
 }
 
 fn draw_value(
@@ -481,6 +901,8 @@ pub enum GraphNodeTemplate {
     LygiaBlendOverlay,
     LygiaCosinePalette,
     TextureSample,
+    WorkspaceModule(Box<wesl_shader_graph_editor::graph::ModuleDefinition>),
+    GlobalModule(Box<wesl_shader_graph_editor::graph::ModuleDefinition>),
     FragmentOutput,
 }
 
@@ -590,6 +1012,9 @@ impl GraphNodeTemplate {
             Self::LygiaBlendOverlay => NodeKind::LygiaBlendOverlay,
             Self::LygiaCosinePalette => NodeKind::LygiaCosinePalette,
             Self::TextureSample => NodeKind::TextureSample,
+            Self::WorkspaceModule(module) | Self::GlobalModule(module) => {
+                NodeKind::Module(module.clone())
+            }
             Self::FragmentOutput => NodeKind::FragmentOutput,
         }
     }
@@ -616,11 +1041,21 @@ impl GraphNodeTemplate {
 #[derive(Clone, Debug, Default)]
 pub struct GraphNodeTemplates {
     filter: Option<ConnectionContext>,
+    workspace_modules: Vec<wesl_shader_graph_editor::graph::ModuleDefinition>,
+    global_modules: Vec<wesl_shader_graph_editor::graph::ModuleDefinition>,
 }
 
 impl GraphNodeTemplates {
-    pub fn compatible_with(filter: Option<ConnectionContext>) -> Self {
-        Self { filter }
+    pub fn compatible_with(
+        filter: Option<ConnectionContext>,
+        workspace_modules: &[wesl_shader_graph_editor::graph::ModuleDefinition],
+        global_modules: &[wesl_shader_graph_editor::graph::ModuleDefinition],
+    ) -> Self {
+        Self {
+            filter,
+            workspace_modules: workspace_modules.to_vec(),
+            global_modules: global_modules.to_vec(),
+        }
     }
 }
 
@@ -628,7 +1063,7 @@ impl NodeTemplateIter for GraphNodeTemplates {
     type Item = GraphNodeTemplate;
 
     fn all_kinds(&self) -> Vec<Self::Item> {
-        let templates = vec![
+        let mut templates = vec![
             GraphNodeTemplate::Uv,
             GraphNodeTemplate::Time,
             GraphNodeTemplate::F32Constant,
@@ -687,6 +1122,18 @@ impl NodeTemplateIter for GraphNodeTemplates {
             GraphNodeTemplate::TextureSample,
             GraphNodeTemplate::FragmentOutput,
         ];
+        templates.extend(
+            self.workspace_modules
+                .iter()
+                .cloned()
+                .map(|module| GraphNodeTemplate::WorkspaceModule(Box::new(module))),
+        );
+        templates.extend(
+            self.global_modules
+                .iter()
+                .cloned()
+                .map(|module| GraphNodeTemplate::GlobalModule(Box::new(module))),
+        );
         if let Some(filter) = self.filter {
             templates
                 .into_iter()
@@ -712,7 +1159,12 @@ impl NodeTemplateTrait for GraphNodeTemplate {
     type CategoryType = &'static str;
 
     fn node_finder_label(&self, _user_state: &mut Self::UserState) -> Cow<'_, str> {
-        Cow::Owned(template_label(self).to_owned())
+        match self {
+            Self::WorkspaceModule(module) | Self::GlobalModule(module) => {
+                Cow::Owned(module.name.clone())
+            }
+            _ => Cow::Owned(template_label(self).to_owned()),
+        }
     }
 
     fn node_finder_categories(&self, _user_state: &mut Self::UserState) -> Vec<Self::CategoryType> {
@@ -720,7 +1172,10 @@ impl NodeTemplateTrait for GraphNodeTemplate {
     }
 
     fn node_graph_label(&self, _user_state: &mut Self::UserState) -> String {
-        self.kind().title().to_owned()
+        match self {
+            Self::WorkspaceModule(module) | Self::GlobalModule(module) => module.name.clone(),
+            _ => self.kind().title().to_owned(),
+        }
     }
 
     fn user_data(&self, user_state: &mut Self::UserState) -> Self::NodeData {
@@ -763,6 +1218,7 @@ pub fn template_label(template: &GraphNodeTemplate) -> &'static str {
         GraphNodeTemplate::DecomposeVec4Y => "Vec4 Y",
         GraphNodeTemplate::DecomposeVec4Z => "Vec4 Z",
         GraphNodeTemplate::DecomposeVec4W => "Vec4 W",
+        GraphNodeTemplate::WorkspaceModule(_) | GraphNodeTemplate::GlobalModule(_) => "Module",
         _ => template.kind().title(),
     }
 }
@@ -825,6 +1281,8 @@ fn template_category(template: &GraphNodeTemplate) -> &'static str {
         | GraphNodeTemplate::LygiaCosinePalette => "10 LYGIA Color",
         GraphNodeTemplate::TextureSample => "11 Textures",
         GraphNodeTemplate::FragmentOutput => "12 Outputs",
+        GraphNodeTemplate::WorkspaceModule(_) => "13 Workspace Nodes",
+        GraphNodeTemplate::GlobalModule(_) => "14 Global Nodes",
     }
 }
 
@@ -872,6 +1330,7 @@ pub fn editor_from_shader_graph(graph: &ShaderGraph) -> (ShaderGraphEditorState,
             editor.graph.add_connection(*output_id, *input_id);
         }
     }
+    resolve_ambiguous_output_types(&mut editor);
 
     (editor, ui_state)
 }
@@ -979,9 +1438,9 @@ pub fn connect_new_node_to_context(
     editor: &mut ShaderGraphEditorState,
     ui_state: &mut GraphUiState,
     new_node: NodeId,
-) -> bool {
+) -> Result<bool, GraphTypeConflict> {
     let Some(context) = ui_state.connection_context else {
-        return false;
+        return Ok(false);
     };
 
     let connected = match context.origin {
@@ -997,9 +1456,12 @@ pub fn connect_new_node_to_context(
                             .is_ok_and(|input_type| *input_type == context.data_type)
                 })
             else {
-                return false;
+                return Ok(false);
             };
-            editor.graph.add_connection(output, *input);
+            let mut candidate = editor.clone();
+            candidate.graph.add_connection(output, *input);
+            resolve_ambiguous_output_types_checked(&mut candidate)?;
+            *editor = candidate;
             true
         }
         AnyParameterId::Input(input) => {
@@ -1014,9 +1476,12 @@ pub fn connect_new_node_to_context(
                             .is_ok_and(|output_type| *output_type == context.data_type)
                     })
             else {
-                return false;
+                return Ok(false);
             };
-            editor.graph.add_connection(*output, input);
+            let mut candidate = editor.clone();
+            candidate.graph.add_connection(*output, input);
+            resolve_ambiguous_output_types_checked(&mut candidate)?;
+            *editor = candidate;
             true
         }
     };
@@ -1024,7 +1489,7 @@ pub fn connect_new_node_to_context(
     if connected {
         ui_state.connection_context = None;
     }
-    connected
+    Ok(connected)
 }
 
 fn add_ports_for_kind(

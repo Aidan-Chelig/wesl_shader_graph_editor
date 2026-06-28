@@ -5,10 +5,10 @@ use bevy::{
 };
 use bevy_egui::{EguiContexts, EguiPlugin, EguiStartupSet, PrimaryEguiContext, egui};
 use egui_graph_edit::{InputId as UiInputId, NodeId as UiNodeId, NodeResponse};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node as SyntaxNode, Parser};
 use wesl_shader_graph_editor::{
-    compiler::{CompiledShader, compile_with_preview_node},
+    compiler::{CompiledShader, compile_preview_graph, compile_with_preview_node},
     graph::{ModuleDefinition, ModulePort, NodeId, NodeKind, ShaderGraph, ShaderType, Value},
 };
 
@@ -21,7 +21,8 @@ use graph_editor::{
     GraphNodeTemplate, GraphNodeTemplates, GraphResponse as ShaderGraphResponse, GraphUiState,
     GraphValueChangeKind, ShaderGraphEditorState, add_kind_to_editor, add_template_to_editor,
     begin_connection_context, begin_disconnected_input_context, connect_new_node_to_context,
-    editor_from_shader_graph, shader_graph_from_editor, template_label,
+    editor_from_shader_graph, resolve_ambiguous_output_types,
+    resolve_ambiguous_output_types_checked, shader_graph_from_editor, template_label,
 };
 use preview::{
     PreviewPlugin, PreviewPrimitive, PreviewSettings, PreviewShaderSource, PreviewTexture,
@@ -59,6 +60,8 @@ struct EditorState {
     graph: ShaderGraph,
     graph_editor: ShaderGraphEditorState,
     graph_ui: GraphUiState,
+    module_tabs: Vec<ModuleEditorTab>,
+    active_tab: EditorTab,
     compilation: Result<CompiledShader, String>,
     selected: Option<NodeId>,
     hovered: Option<NodeId>,
@@ -71,6 +74,7 @@ struct EditorState {
     node_context_menu: Option<NodeContextMenu>,
     module_prompt: Option<ModulePrompt>,
     modules: Vec<ModuleDefinition>,
+    global_modules: Vec<ModuleDefinition>,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -91,6 +95,8 @@ impl Default for EditorState {
             graph,
             graph_editor,
             graph_ui,
+            module_tabs: Vec::new(),
+            active_tab: EditorTab::Main,
             compilation,
             selected: None,
             hovered: None,
@@ -103,8 +109,26 @@ impl Default for EditorState {
             node_context_menu: None,
             module_prompt: None,
             modules: Vec::new(),
+            global_modules: load_user_modules().unwrap_or_default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorTab {
+    Main,
+    Module(u64),
+}
+
+#[derive(Clone)]
+struct ModuleEditorTab {
+    module_id: u64,
+    title: String,
+    module: ModuleDefinition,
+    graph: ShaderGraph,
+    graph_editor: ShaderGraphEditorState,
+    graph_ui: GraphUiState,
+    preview_node: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,7 +145,7 @@ struct ModulePrompt {
     save_to_user_library: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct ProjectFile {
     graph: ShaderGraph,
     preview_node: Option<NodeId>,
@@ -137,6 +161,121 @@ fn setup_camera(mut commands: Commands) {
     ));
 }
 
+fn draw_editor_tabs(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut state.active_tab, EditorTab::Main, "Main Graph");
+        let mut close_module = None;
+        for tab in &state.module_tabs {
+            ui.selectable_value(
+                &mut state.active_tab,
+                EditorTab::Module(tab.module_id),
+                &tab.title,
+            );
+            if ui
+                .small_button("x")
+                .on_hover_text("Close module tab")
+                .clicked()
+            {
+                close_module = Some(tab.module_id);
+            }
+        }
+        if let Some(module_id) = close_module {
+            state.module_tabs.retain(|tab| tab.module_id != module_id);
+            if state.active_tab == EditorTab::Module(module_id) {
+                state.active_tab = EditorTab::Main;
+            }
+        }
+    });
+}
+
+fn open_module_editor_tab(state: &mut EditorState, module: &ModuleDefinition) {
+    if state
+        .module_tabs
+        .iter()
+        .any(|tab| tab.module_id == module.id)
+    {
+        state.active_tab = EditorTab::Module(module.id);
+        return;
+    }
+
+    let graph = (*module.graph).clone();
+    let mut module = module.clone();
+    module.root = module_root_from_shader_graph(&graph, module.root);
+    module.output.node = Some(module.root);
+    let (graph_editor, graph_ui) = editor_from_shader_graph(&graph);
+    let preview_node = Some(module.root);
+    let module_id = module.id;
+    state.module_tabs.push(ModuleEditorTab {
+        module_id,
+        title: module.name.clone(),
+        module,
+        graph,
+        graph_editor,
+        graph_ui,
+        preview_node,
+    });
+    sync_module_tab(state, module_id, true);
+    state.active_tab = EditorTab::Module(module_id);
+}
+
+fn sync_module_tab(state: &mut EditorState, module_id: u64, update_signature: bool) {
+    let Some(tab_index) = state
+        .module_tabs
+        .iter()
+        .position(|tab| tab.module_id == module_id)
+    else {
+        return;
+    };
+
+    let mut module = state.module_tabs[tab_index].module.clone();
+    let graph = shader_graph_from_editor(&state.module_tabs[tab_index].graph_editor);
+    if update_signature {
+        module.root = module_root_from_shader_graph(&graph, module.root);
+        module.output.node = Some(module.root);
+        if let Ok(compiled) = compile_preview_graph(&graph, module.root)
+            && let Some(shader_type) = compiled.node_types.get(&module.root).copied()
+        {
+            module.output.shader_type = shader_type;
+        }
+    }
+    module.graph = Box::new(graph.clone());
+    state.module_tabs[tab_index].graph = graph;
+    state.module_tabs[tab_index].module = module.clone();
+
+    if let Some(existing) = state
+        .modules
+        .iter_mut()
+        .find(|existing| existing.id == module.id)
+    {
+        *existing = module.clone();
+    }
+
+    for (_, ui_node) in &mut state.graph_editor.graph.nodes {
+        if let NodeKind::Module(existing) = &mut ui_node.user_data.kind
+            && existing.id == module.id
+        {
+            *existing = Box::new(module.clone());
+        }
+    }
+    state.graph = shader_graph_from_editor(&state.graph_editor);
+}
+
+fn active_graph_and_preview(state: &EditorState) -> (&ShaderGraph, Option<NodeId>) {
+    match state.active_tab {
+        EditorTab::Main => (&state.graph, state.preview_node),
+        EditorTab::Module(module_id) => state
+            .module_tabs
+            .iter()
+            .find(|tab| tab.module_id == module_id)
+            .map(|tab| (&tab.graph, tab.preview_node))
+            .unwrap_or((&state.graph, state.preview_node)),
+    }
+}
+
+fn active_graph(state: &EditorState) -> &ShaderGraph {
+    active_graph_and_preview(state).0
+}
+
 fn editor_ui(
     mut contexts: EguiContexts,
     mut state: ResMut<EditorState>,
@@ -150,6 +289,7 @@ fn editor_ui(
     let context = contexts.ctx_mut()?;
     let state = state.as_mut();
     let mut recompile_requested = false;
+    let active_tab_before_ui = state.active_tab;
     let mut viewport_ui = egui::Ui::new(
         context.clone(),
         "shader_editor_viewport".into(),
@@ -176,13 +316,36 @@ fn editor_ui(
                             430.0 + state.spawn_offset * 0.35,
                         );
                         state.spawn_offset = (state.spawn_offset + 32.0) % 260.0;
-                        add_template_to_editor(
-                            &mut state.graph_editor,
-                            &mut state.graph_ui,
-                            template,
-                            position,
-                        );
-                        state.graph = shader_graph_from_editor(&state.graph_editor);
+                        match state.active_tab {
+                            EditorTab::Main => {
+                                add_template_to_editor(
+                                    &mut state.graph_editor,
+                                    &mut state.graph_ui,
+                                    template,
+                                    position,
+                                );
+                                state.graph = shader_graph_from_editor(&state.graph_editor);
+                            }
+                            EditorTab::Module(module_id) => {
+                                let mut added = false;
+                                if let Some(tab) = state
+                                    .module_tabs
+                                    .iter_mut()
+                                    .find(|tab| tab.module_id == module_id)
+                                {
+                                    add_template_to_editor(
+                                        &mut tab.graph_editor,
+                                        &mut tab.graph_ui,
+                                        template,
+                                        position,
+                                    );
+                                    added = true;
+                                }
+                                if added {
+                                    sync_module_tab(state, module_id, true);
+                                }
+                            }
+                        }
                         recompile_requested = true;
                         ui.close();
                     }
@@ -217,6 +380,15 @@ fn editor_ui(
             }
         });
     });
+
+    if !state.module_tabs.is_empty() {
+        egui::Panel::top("tabs").show_inside(&mut viewport_ui, |ui| {
+            draw_editor_tabs(ui, state);
+        });
+    }
+    if state.active_tab != active_tab_before_ui {
+        recompile_graph(state, &mut preview_shader, &mut preview_uniforms);
+    }
 
     egui::Panel::right("source")
         .default_size(480.0)
@@ -265,10 +437,19 @@ fn editor_ui(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show_inside(&mut viewport_ui, |ui| {
+            if let EditorTab::Module(module_id) = state.active_tab {
+                draw_module_editor_tab(ui, state, module_id, &mut graph_edit);
+                return;
+            }
+
             let had_connection_in_progress = state.graph_editor.connection_in_progress.is_some();
             let had_node_finder = state.graph_editor.node_finder.is_some();
-            let node_templates =
-                GraphNodeTemplates::compatible_with(state.graph_ui.connection_context);
+            let editor_before_draw = state.graph_editor.clone();
+            let node_templates = GraphNodeTemplates::compatible_with(
+                state.graph_ui.connection_context,
+                &state.modules,
+                &state.global_modules,
+            );
             let response = state.graph_editor.draw_graph_editor(
                 ui,
                 node_templates,
@@ -280,20 +461,62 @@ fn editor_ui(
             for node_response in response.node_responses {
                 match node_response {
                     NodeResponse::CreatedNode(node_id) => {
-                        connect_new_node_to_context(
+                        match connect_new_node_to_context(
                             &mut state.graph_editor,
                             &mut state.graph_ui,
                             node_id,
-                        );
+                        ) {
+                            Ok(true) => {
+                                state.graph_ui.conflict_nodes.clear();
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                state.graph_ui.conflict_nodes = error.nodes;
+                                state.export_status = Some(error.message);
+                            }
+                        }
                         graph_edit.source_changed = true;
                     }
-                    NodeResponse::ConnectEventEnded { .. }
-                    | NodeResponse::DeleteNodeFull { .. }
-                    | NodeResponse::DeleteNodeUi(_) => {
+                    NodeResponse::ConnectEventEnded { input, output } => {
+                        let mut candidate = editor_before_draw.clone();
+                        candidate.graph.add_connection(output, input);
+                        match resolve_ambiguous_output_types_checked(&mut candidate) {
+                            Ok(()) => {
+                                candidate.connection_in_progress = None;
+                                state.graph_editor = candidate;
+                                state.graph_ui.conflict_nodes.clear();
+                            }
+                            Err(error) => {
+                                let mut restored = editor_before_draw.clone();
+                                restored.connection_in_progress = None;
+                                state.graph_editor = restored;
+                                state.graph_ui.conflict_nodes = error.nodes;
+                                state.export_status = Some(error.message);
+                            }
+                        }
+                        state.graph_ui.connection_context = None;
+                        graph_edit.source_changed = true;
+                    }
+                    NodeResponse::DeleteNodeFull { .. } | NodeResponse::DeleteNodeUi(_) => {
+                        resolve_ambiguous_output_types(&mut state.graph_editor);
                         state.graph_ui.connection_context = None;
                         graph_edit.source_changed = true;
                     }
                     NodeResponse::DisconnectEvent { output, .. } => {
+                        let mut candidate = state.graph_editor.clone();
+                        match resolve_ambiguous_output_types_checked(&mut candidate) {
+                            Ok(()) => {
+                                state.graph_editor = candidate;
+                                state.graph_ui.conflict_nodes.clear();
+                            }
+                            Err(error) => {
+                                let mut restored = editor_before_draw.clone();
+                                restored.connection_in_progress = None;
+                                state.graph_editor = restored;
+                                state.graph_ui.conflict_nodes = error.nodes;
+                                state.export_status = Some(error.message);
+                            }
+                        }
                         begin_disconnected_input_context(
                             &state.graph_editor,
                             &mut state.graph_ui,
@@ -383,6 +606,15 @@ fn editor_ui(
                 state.preview_node = state.graph_ui.preview_node;
             }
         });
+
+    if let EditorTab::Module(module_id) = state.active_tab
+        && let Some(tab) = state
+            .module_tabs
+            .iter_mut()
+            .find(|tab| tab.module_id == module_id)
+    {
+        tab.preview_node = tab.graph_ui.preview_node;
+    }
 
     if let Some(path) = state.pending_texture_path.take() {
         match load_texture_image(&path, &mut images) {
@@ -595,6 +827,22 @@ fn draw_node_context_menu(ui: &mut egui::Ui, state: &mut EditorState) {
         .fixed_pos(menu.position)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
+                let module = state
+                    .graph_editor
+                    .graph
+                    .nodes
+                    .get(menu.node)
+                    .and_then(|node| match &node.user_data.kind {
+                        NodeKind::Module(module) => Some((**module).clone()),
+                        _ => None,
+                    });
+                if let Some(module) = module {
+                    if ui.button("Edit Module").clicked() {
+                        open_module_editor_tab(state, &module);
+                        close = true;
+                    }
+                    ui.separator();
+                }
                 if ui.button("Create Module Node").clicked() {
                     state.module_prompt = Some(ModulePrompt {
                         root: menu.node,
@@ -637,7 +885,10 @@ fn draw_module_prompt(ui: &mut egui::Ui, state: &mut EditorState, graph_edit: &m
                             let summary = module_summary(&module);
                             let save_status = if prompt.save_to_user_library {
                                 match save_user_module(&module) {
-                                    Ok(path) => format!(" · saved to {}", path.display()),
+                                    Ok(path) => {
+                                        upsert_module(&mut state.global_modules, module.clone());
+                                        format!(" · saved to {}", path.display())
+                                    }
                                     Err(error) => format!(" · local save failed: {error}"),
                                 }
                             } else {
@@ -645,7 +896,7 @@ fn draw_module_prompt(ui: &mut egui::Ui, state: &mut EditorState, graph_edit: &m
                             };
                             match replace_selection_with_module(state, prompt.root, &module) {
                                 Ok(()) => {
-                                    state.modules.push(module);
+                                    upsert_module(&mut state.modules, module);
                                     state.export_status = Some(format!("{summary}{save_status}"));
                                     graph_edit.source_changed = true;
                                     graph_edit.preview_changed = true;
@@ -672,6 +923,175 @@ fn draw_module_prompt(ui: &mut egui::Ui, state: &mut EditorState, graph_edit: &m
         state.module_prompt = None;
     } else if let Some(current) = &mut state.module_prompt {
         *current = prompt;
+    }
+}
+
+fn draw_module_editor_tab(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    module_id: u64,
+    graph_edit: &mut GraphEdit,
+) {
+    let Some(tab_index) = state
+        .module_tabs
+        .iter()
+        .position(|tab| tab.module_id == module_id)
+    else {
+        state.active_tab = EditorTab::Main;
+        return;
+    };
+
+    let mut source_changed = false;
+    let mut position_changed = false;
+    let mut preview_changed = false;
+    let mut pending_texture = None;
+    let mut export_status = None;
+    let mut hovered = None;
+
+    {
+        let tab = &mut state.module_tabs[tab_index];
+        let had_connection_in_progress = tab.graph_editor.connection_in_progress.is_some();
+        let had_node_finder = tab.graph_editor.node_finder.is_some();
+        let editor_before_draw = tab.graph_editor.clone();
+        let node_templates = GraphNodeTemplates::compatible_with(
+            tab.graph_ui.connection_context,
+            &state.modules,
+            &state.global_modules,
+        );
+        let response =
+            tab.graph_editor
+                .draw_graph_editor(ui, node_templates, &mut tab.graph_ui, Vec::new());
+
+        for node_response in response.node_responses {
+            match node_response {
+                NodeResponse::CreatedNode(node_id) => {
+                    match connect_new_node_to_context(
+                        &mut tab.graph_editor,
+                        &mut tab.graph_ui,
+                        node_id,
+                    ) {
+                        Ok(true) => tab.graph_ui.conflict_nodes.clear(),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tab.graph_ui.conflict_nodes = error.nodes;
+                            export_status = Some(error.message);
+                        }
+                    }
+                    source_changed = true;
+                }
+                NodeResponse::ConnectEventEnded { input, output } => {
+                    let mut candidate = editor_before_draw.clone();
+                    candidate.graph.add_connection(output, input);
+                    match resolve_ambiguous_output_types_checked(&mut candidate) {
+                        Ok(()) => {
+                            candidate.connection_in_progress = None;
+                            tab.graph_editor = candidate;
+                            tab.graph_ui.conflict_nodes.clear();
+                        }
+                        Err(error) => {
+                            let mut restored = editor_before_draw.clone();
+                            restored.connection_in_progress = None;
+                            tab.graph_editor = restored;
+                            tab.graph_ui.conflict_nodes = error.nodes;
+                            export_status = Some(error.message);
+                        }
+                    }
+                    tab.graph_ui.connection_context = None;
+                    source_changed = true;
+                }
+                NodeResponse::DeleteNodeFull { .. } | NodeResponse::DeleteNodeUi(_) => {
+                    resolve_ambiguous_output_types(&mut tab.graph_editor);
+                    tab.graph_ui.connection_context = None;
+                    source_changed = true;
+                }
+                NodeResponse::DisconnectEvent { output, .. } => {
+                    let mut candidate = tab.graph_editor.clone();
+                    match resolve_ambiguous_output_types_checked(&mut candidate) {
+                        Ok(()) => {
+                            tab.graph_editor = candidate;
+                            tab.graph_ui.conflict_nodes.clear();
+                        }
+                        Err(error) => {
+                            let mut restored = editor_before_draw.clone();
+                            restored.connection_in_progress = None;
+                            tab.graph_editor = restored;
+                            tab.graph_ui.conflict_nodes = error.nodes;
+                            export_status = Some(error.message);
+                        }
+                    }
+                    begin_disconnected_input_context(&tab.graph_editor, &mut tab.graph_ui, output);
+                    source_changed = true;
+                }
+                NodeResponse::MoveNode { .. } => {
+                    position_changed = true;
+                }
+                NodeResponse::HoverNode(node_id) => {
+                    if let Some(node) = tab.graph_editor.graph.nodes.get(node_id) {
+                        hovered = Some(node.user_data.shader_id);
+                    }
+                }
+                NodeResponse::SelectConnectedNode(node_id) => {
+                    select_contiguous_nodes(&mut tab.graph_editor, node_id);
+                }
+                NodeResponse::SelectNode(_) | NodeResponse::ContextNode(_, _) => {}
+                NodeResponse::User(ShaderGraphResponse::ValueChanged { node, value, kind }) => {
+                    apply_graph_editor_value_change(&mut tab.graph_editor, node, value);
+                    match kind {
+                        GraphValueChangeKind::Source => source_changed = true,
+                        GraphValueChangeKind::Uniform => source_changed = true,
+                    }
+                }
+                NodeResponse::User(ShaderGraphResponse::RenameNode { node, name }) => {
+                    if !name.is_empty() {
+                        rename_graph_editor_node(&mut tab.graph_editor, node, &name);
+                        source_changed = true;
+                    }
+                }
+                NodeResponse::User(ShaderGraphResponse::PreviewChanged) => {
+                    preview_changed = true;
+                }
+                NodeResponse::User(ShaderGraphResponse::LoadTextureRequested) => {
+                    pending_texture = rfd::FileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga", "hdr"])
+                        .pick_file()
+                        .map(|path| path.display().to_string());
+                }
+                NodeResponse::ConnectEventStarted(_, port) => {
+                    begin_connection_context(&tab.graph_editor, &mut tab.graph_ui, port);
+                }
+                NodeResponse::RaiseNode(_) => {}
+            }
+        }
+
+        let has_connection_in_progress = tab.graph_editor.connection_in_progress.is_some();
+        let has_node_finder = tab.graph_editor.node_finder.is_some();
+        let opened_finder_from_connection =
+            !had_node_finder && has_node_finder && had_connection_in_progress;
+        if tab.graph_ui.connection_context.is_some()
+            && !has_connection_in_progress
+            && (!has_node_finder || (!had_node_finder && !opened_finder_from_connection))
+        {
+            tab.graph_ui.connection_context = None;
+        }
+    }
+
+    state.hovered = hovered;
+    if let Some(status) = export_status {
+        state.export_status = Some(status);
+    }
+    if let Some(path) = pending_texture {
+        state.pending_texture_path = Some(path);
+    }
+    if source_changed {
+        sync_module_tab(state, module_id, true);
+        graph_edit.source_changed = true;
+    }
+    if position_changed {
+        sync_module_tab(state, module_id, false);
+        graph_edit.position_changed = true;
+    }
+    if preview_changed {
+        graph_edit.preview_changed = true;
     }
 }
 
@@ -704,6 +1124,7 @@ fn create_module_from_selection(
         .get(root_ui_node)
         .map(|node| node.user_data.shader_id)
         .ok_or_else(|| "context node no longer exists".to_owned())?;
+    let root = module_root_from_shader_graph(&state.graph, root);
 
     let input_node_set = shader_nodes
         .iter()
@@ -735,6 +1156,7 @@ fn create_module_from_selection(
         .and_then(|compiled| compiled.node_types.get(&root).copied())
         .unwrap_or(ShaderType::Vec4);
     let graph = module_subgraph_from_nodes(&state.graph, &shader_nodes);
+    let root = module_root_from_shader_graph(&graph, root);
 
     Ok(ModuleDefinition {
         id: state.modules.len() as u64 + 1,
@@ -769,13 +1191,22 @@ fn replace_selection_with_module(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let root_shader = state
-        .graph_editor
-        .graph
-        .nodes
-        .get(root_ui_node)
-        .map(|node| node.user_data.shader_id)
-        .ok_or_else(|| "context node no longer exists".to_owned())?;
+    let root_shader = module.root;
+    let cloned_inputs = module
+        .inputs
+        .iter()
+        .map(|input| {
+            let value = input
+                .node
+                .and_then(|node_id| state.graph.node(node_id))
+                .and_then(|node| match &node.kind {
+                    NodeKind::Uniform(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| default_value_for_shader_type(input.shader_type));
+            (input.name.clone(), value)
+        })
+        .collect::<Vec<_>>();
 
     let outgoing_targets = state
         .graph_editor
@@ -825,11 +1256,61 @@ fn replace_selection_with_module(
         position,
     );
 
+    let mut selected_nodes = vec![module_ui_node];
+    for (index, (name, value)) in cloned_inputs.into_iter().enumerate() {
+        let input_position = egui::pos2(
+            position.x - 280.0,
+            position.y + index as f32 * 110.0 - module.inputs.len() as f32 * 55.0 + 55.0,
+        );
+        let (uniform_ui_node, _) = add_kind_to_editor(
+            &mut state.graph_editor,
+            &mut state.graph_ui,
+            NodeKind::Uniform(value),
+            name,
+            input_position,
+        );
+        if let (Some(uniform_output), Some(module_input)) = (
+            state.graph_editor.graph.nodes[uniform_ui_node]
+                .outputs
+                .first()
+                .map(|(_, output)| *output),
+            state.graph_editor.graph.nodes[module_ui_node]
+                .inputs
+                .get(index)
+                .map(|(_, input)| *input),
+        ) {
+            state
+                .graph_editor
+                .graph
+                .add_connection(uniform_output, module_input);
+        }
+        selected_nodes.push(uniform_ui_node);
+    }
+
     if let Some(module_output) = state.graph_editor.graph.nodes[module_ui_node]
         .outputs
         .first()
         .map(|(_, output)| *output)
     {
+        let (output_ui_node, _) = add_kind_to_editor(
+            &mut state.graph_editor,
+            &mut state.graph_ui,
+            NodeKind::FragmentOutput,
+            "Fragment Output".to_owned(),
+            egui::pos2(position.x + 320.0, position.y),
+        );
+        if let Some(output_input) = state.graph_editor.graph.nodes[output_ui_node]
+            .inputs
+            .first()
+            .map(|(_, input)| *input)
+        {
+            state
+                .graph_editor
+                .graph
+                .add_connection(module_output, output_input);
+        }
+        selected_nodes.push(output_ui_node);
+
         for input_id in outgoing_targets {
             if state.graph_editor.graph.inputs.contains_key(input_id) {
                 state
@@ -840,7 +1321,7 @@ fn replace_selection_with_module(
         }
     }
 
-    state.graph_editor.selected_nodes = vec![module_ui_node];
+    state.graph_editor.selected_nodes = selected_nodes;
     state.selected = Some(module_shader_id);
     if state
         .preview_node
@@ -851,6 +1332,15 @@ fn replace_selection_with_module(
     }
     state.graph = shader_graph_from_editor(&state.graph_editor);
     Ok(())
+}
+
+fn default_value_for_shader_type(shader_type: ShaderType) -> Value {
+    match shader_type {
+        ShaderType::F32 => Value::F32(1.0),
+        ShaderType::Vec2 => Value::Vec2([1.0, 1.0]),
+        ShaderType::Vec3 => Value::Vec3([1.0, 1.0, 1.0]),
+        ShaderType::Vec4 => Value::Vec4([1.0, 1.0, 1.0, 1.0]),
+    }
 }
 
 fn average_node_position(
@@ -899,6 +1389,39 @@ fn save_user_module(module: &ModuleDefinition) -> Result<std::path::PathBuf, Str
     Ok(path)
 }
 
+fn load_user_modules() -> Result<Vec<ModuleDefinition>, String> {
+    let directory = user_modules_dir()?;
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut modules = Vec::new();
+    for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("ron") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let project = ron::from_str::<ProjectFile>(&source).map_err(|error| error.to_string())?;
+        modules.extend(project.modules);
+    }
+    modules.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    modules.dedup_by(|left, right| left.id == right.id && left.name == right.name);
+    Ok(modules)
+}
+
+fn upsert_module(modules: &mut Vec<ModuleDefinition>, module: ModuleDefinition) {
+    if let Some(existing) = modules
+        .iter_mut()
+        .find(|existing| existing.id == module.id && existing.name == module.name)
+    {
+        *existing = module;
+    } else {
+        modules.push(module);
+    }
+}
+
 fn module_subgraph_from_nodes(graph: &ShaderGraph, nodes: &[NodeId]) -> ShaderGraph {
     let node_set = nodes
         .iter()
@@ -921,6 +1444,15 @@ fn module_subgraph_from_nodes(graph: &ShaderGraph, nodes: &[NodeId]) -> ShaderGr
         format_version: graph.format_version,
         nodes,
     }
+}
+
+fn module_root_from_shader_graph(graph: &ShaderGraph, fallback: NodeId) -> NodeId {
+    graph
+        .fragment_output()
+        .and_then(|output| output.inputs.first())
+        .and_then(|connection| *connection)
+        .map(|connection| connection.node)
+        .unwrap_or(fallback)
 }
 
 fn user_modules_dir() -> Result<std::path::PathBuf, String> {
@@ -1386,14 +1918,29 @@ fn recompile_graph(
     preview_shader: &mut PreviewShaderSource,
     preview_uniforms: &mut PreviewUniformValues,
 ) {
-    state.compilation = compile_with_preview_node(&state.graph, state.preview_node)
-        .map_err(|error| error.to_string());
+    state.compilation = match state.active_tab {
+        EditorTab::Main => compile_with_preview_node(&state.graph, state.preview_node)
+            .map_err(|error| error.to_string()),
+        EditorTab::Module(module_id) => {
+            if let Some(tab) = state
+                .module_tabs
+                .iter()
+                .find(|tab| tab.module_id == module_id)
+            {
+                let preview_node = tab.preview_node.unwrap_or(tab.module.root);
+                compile_preview_graph(&tab.graph, preview_node).map_err(|error| error.to_string())
+            } else {
+                compile_with_preview_node(&state.graph, state.preview_node)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    };
     if let Ok(compiled) = &state.compilation {
         if preview_shader.wesl != compiled.bevy_wesl || preview_shader.wgsl != compiled.bevy_wgsl {
             preview_shader.wesl.clone_from(&compiled.bevy_wesl);
             preview_shader.wgsl.clone_from(&compiled.bevy_wgsl);
         }
-        update_preview_uniforms(&state.graph, compiled, preview_uniforms);
+        update_preview_uniforms(active_graph(state), compiled, preview_uniforms);
     }
 }
 
@@ -1417,7 +1964,7 @@ fn apply_graph_editor_value_change(
 
 fn sync_preview_uniforms(state: &EditorState, preview_uniforms: &mut PreviewUniformValues) {
     if let Ok(compiled) = &state.compilation {
-        update_preview_uniforms(&state.graph, compiled, preview_uniforms);
+        update_preview_uniforms(active_graph(state), compiled, preview_uniforms);
     }
 }
 

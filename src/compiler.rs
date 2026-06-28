@@ -567,6 +567,64 @@ pub fn compile_with_preview_node(
     })
 }
 
+pub fn compile_preview_graph(
+    graph: &ShaderGraph,
+    preview_node: NodeId,
+) -> Result<CompiledShader, CompileError> {
+    let preview_entry = compile_preview_output(graph, preview_node)?;
+    let texture_count = preview_entry.textures.len().max(1);
+    let wesl = generate_graph_wesl(
+        &preview_entry.helpers.wesl,
+        &preview_entry.statements,
+        &preview_entry.target,
+        &preview_entry.color_expression,
+        preview_entry.textures.len(),
+    );
+    let wgsl_source = generate_graph_wesl(
+        &preview_entry.helpers.wgsl,
+        &preview_entry.statements,
+        &preview_entry.target,
+        &preview_entry.color_expression,
+        preview_entry.textures.len(),
+    );
+    let wgsl = link_wesl(&wgsl_source);
+    let bevy_wesl = generate_bevy_wesl(
+        &preview_entry.helpers.wesl,
+        &preview_entry.statements,
+        &preview_entry.target,
+        &preview_entry
+            .color_expression
+            .replace("input.uv", "mesh.uv"),
+        texture_count,
+    );
+    let bevy_wgsl = link_wesl(&generate_bevy_wesl(
+        &preview_entry.helpers.wgsl,
+        &preview_entry.statements,
+        &preview_entry.target,
+        &preview_entry
+            .color_expression
+            .replace("input.uv", "mesh.uv"),
+        texture_count,
+    ));
+    let uniforms = preview_entry.uniforms.clone();
+    let textures = preview_entry.textures.clone();
+    let emitted_nodes = preview_entry.emitted_nodes.clone();
+    let node_types = preview_entry.node_types.clone();
+
+    validate_wgsl(&wgsl)?;
+
+    Ok(CompiledShader {
+        wesl,
+        wgsl,
+        bevy_wesl,
+        bevy_wgsl,
+        node_types,
+        emitted_nodes,
+        uniforms,
+        textures,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct CompiledEntry {
     target: Node,
@@ -634,10 +692,14 @@ fn compile_preview_output(
         .clone();
     let mut compiler = Compiler::new(graph);
     let color = compiler.compile_node(node_id)?;
-    if color.shader_type != ShaderType::Vec4 {
+    if !matches!(
+        color.shader_type,
+        ShaderType::F32 | ShaderType::Vec3 | ShaderType::Vec4
+    ) {
         return Err(type_mismatch(&target, "preview", &[color.shader_type]));
     }
-    Ok(compiler.finish(target, color.expression))
+    let color_expression = convert_preview_to_vec4(&color.expression, color.shader_type);
+    Ok(compiler.finish(target, color_expression))
 }
 
 fn generate_bevy_wesl(
@@ -722,6 +784,7 @@ fn link_wesl(wesl: &str) -> String {
 
 struct Compiler<'a> {
     graph: &'a ShaderGraph,
+    namespace: String,
     visiting: HashSet<NodeId>,
     compiled: HashMap<NodeId, CompiledNode>,
     statements: Vec<String>,
@@ -738,6 +801,7 @@ impl Compiler<'_> {
     fn new(graph: &ShaderGraph) -> Compiler<'_> {
         Compiler {
             graph,
+            namespace: String::new(),
             visiting: HashSet::new(),
             compiled: HashMap::new(),
             statements: Vec::new(),
@@ -753,12 +817,14 @@ impl Compiler<'_> {
 
     fn new_with_overrides(
         graph: &ShaderGraph,
+        namespace: String,
         overrides: HashMap<NodeId, CompiledNode>,
         uniform_offset: usize,
         texture_offset: usize,
     ) -> Compiler<'_> {
         Compiler {
             graph,
+            namespace,
             visiting: HashSet::new(),
             compiled: HashMap::new(),
             statements: Vec::new(),
@@ -854,6 +920,7 @@ impl Compiler<'_> {
 
                 let mut nested = Compiler::new_with_overrides(
                     &module.graph,
+                    format!("{}node_{}_", self.namespace, node.id.0),
                     overrides,
                     self.uniform_offset + self.uniforms.len(),
                     self.texture_offset + self.textures.len(),
@@ -1192,7 +1259,7 @@ impl Compiler<'_> {
             NodeKind::FragmentOutput => unreachable!("output is compiled as an entry point"),
         };
 
-        let variable = format!("node_{}", node.id.0);
+        let variable = format!("{}node_{}", self.namespace, node.id.0);
         self.statements.push(format!(
             "    // node: {} \"{}\"\n    let {}: {} = {};\n",
             node.id.0,
@@ -1443,6 +1510,15 @@ fn convert_to_vec4(expression: &str, shader_type: ShaderType) -> String {
     }
 }
 
+fn convert_preview_to_vec4(expression: &str, shader_type: ShaderType) -> String {
+    match shader_type {
+        ShaderType::F32 => format!("vec4<f32>({expression}, {expression}, {expression}, 1.0)"),
+        ShaderType::Vec3 => format!("vec4<f32>({expression}, 1.0)"),
+        ShaderType::Vec4 => expression.to_owned(),
+        ShaderType::Vec2 => unreachable!("vec2 is not a supported preview output"),
+    }
+}
+
 fn color3_expression(
     node: &Node,
     operation: &'static str,
@@ -1519,7 +1595,7 @@ fn validate_wgsl(source: &str) -> Result<(), CompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Connection, Node};
+    use crate::graph::{Connection, ModuleDefinition, Node};
 
     #[test]
     fn example_graph_generates_wesl_and_valid_wgsl() {
@@ -1909,16 +1985,47 @@ mod tests {
     }
 
     #[test]
-    fn preview_node_requires_vec4_output() {
-        let error =
-            compile_with_preview_node(&ShaderGraph::example(), Some(NodeId(2))).unwrap_err();
+    fn preview_node_casts_f32_to_grayscale_vec4() {
+        let compiled = compile_with_preview_node(&ShaderGraph::example(), Some(NodeId(2))).unwrap();
+
+        assert!(
+            compiled
+                .bevy_wesl
+                .contains("return vec4<f32>(node_2, node_2, node_2, 1.0);")
+        );
+    }
+
+    #[test]
+    fn preview_node_casts_vec3_to_opaque_vec4() {
+        let graph = lygia_graph([(
+            NodeId(1),
+            NodeKind::Constant(Value::Vec3([0.2, 0.4, 0.6])),
+            vec![],
+        )]);
+        let compiled = compile_with_preview_node(&graph, Some(NodeId(1))).unwrap();
+
+        assert!(
+            compiled
+                .bevy_wesl
+                .contains("return vec4<f32>(node_1, 1.0);")
+        );
+    }
+
+    #[test]
+    fn preview_node_rejects_vec2_output() {
+        let graph = lygia_graph([(
+            NodeId(1),
+            NodeKind::Constant(Value::Vec2([0.2, 0.4])),
+            vec![],
+        )]);
+        let error = compile_with_preview_node(&graph, Some(NodeId(1))).unwrap_err();
 
         assert_eq!(
             error,
             CompileError::TypeMismatch {
-                node: NodeId(2),
+                node: NodeId(1),
                 operation: "preview",
-                inputs: vec![ShaderType::F32],
+                inputs: vec![ShaderType::Vec2],
             }
         );
     }
@@ -1958,5 +2065,51 @@ mod tests {
         let compiled = compile(&graph).unwrap();
         assert!(compiled.wesl.contains("let node_2: f32 = 0.25;"));
         assert!(compiled.bevy_wesl.contains("let node_2: f32 = 0.25;"));
+    }
+
+    #[test]
+    fn repeated_module_instances_get_unique_local_names() {
+        let module_graph = ShaderGraph {
+            format_version: crate::graph::GRAPH_FORMAT_VERSION,
+            nodes: vec![Node::new(
+                NodeId(2),
+                NodeKind::Constant(Value::F32(0.24)),
+                [0.0, 0.0],
+            )],
+        };
+        let module = ModuleDefinition {
+            id: 1,
+            name: "Constant Module".to_owned(),
+            root: NodeId(2),
+            nodes: vec![NodeId(2)],
+            inputs: Vec::new(),
+            output: crate::graph::ModulePort {
+                name: "Output".to_owned(),
+                shader_type: ShaderType::F32,
+                node: Some(NodeId(2)),
+            },
+            graph: Box::new(module_graph),
+        };
+        let first = Node::new(
+            NodeId(10),
+            NodeKind::Module(Box::new(module.clone())),
+            [0.0, 0.0],
+        );
+        let second = Node::new(NodeId(11), NodeKind::Module(Box::new(module)), [0.0, 0.0]);
+        let mut multiply = Node::new(NodeId(12), NodeKind::Multiply, [0.0, 0.0]);
+        multiply.connect_input(0, NodeId(10));
+        multiply.connect_input(1, NodeId(11));
+        let mut output = Node::new(NodeId(13), NodeKind::FragmentOutput, [0.0, 0.0]);
+        output.connect_input(0, NodeId(12));
+
+        let compiled = compile(&ShaderGraph {
+            format_version: crate::graph::GRAPH_FORMAT_VERSION,
+            nodes: vec![first, second, multiply, output],
+        })
+        .unwrap();
+
+        assert!(compiled.wgsl.contains("let node_10_node_2: f32 = 0.24;"));
+        assert!(compiled.wgsl.contains("let node_11_node_2: f32 = 0.24;"));
+        assert!(!compiled.wgsl.contains("let node_2: f32 = 0.24;"));
     }
 }
