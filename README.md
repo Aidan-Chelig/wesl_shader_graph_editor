@@ -2,6 +2,10 @@
 
 A typed node shader editor for building portable WGSL/WESL shader graphs with a live Bevy preview.
 
+
+## preview
+<img width="960" height="540" alt="2026-06-27 16-32-06" src="https://github.com/user-attachments/assets/6e58a429-e5dd-4b2e-b57a-819353a8269b" />
+
 ## Features
 
 - Visual shader graph editing with typed ports for `f32`, `vec2`, `vec3`, and `vec4` values.
