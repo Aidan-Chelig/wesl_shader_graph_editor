@@ -86,6 +86,18 @@ pub enum NodeKind {
     Abs,
     Fract,
     Normalize,
+    ComposeVec2,
+    ComposeVec3,
+    ComposeVec4,
+    DecomposeVec2X,
+    DecomposeVec2Y,
+    DecomposeVec3X,
+    DecomposeVec3Y,
+    DecomposeVec3Z,
+    DecomposeVec4X,
+    DecomposeVec4Y,
+    DecomposeVec4Z,
+    DecomposeVec4W,
     LygiaRandom,
     LygiaValueNoise,
     LygiaFbm,
@@ -131,6 +143,18 @@ impl NodeKind {
             Self::Abs => "Absolute",
             Self::Fract => "Fract",
             Self::Normalize => "Normalize",
+            Self::ComposeVec2 => "Compose vec2",
+            Self::ComposeVec3 => "Compose vec3",
+            Self::ComposeVec4 => "Compose vec4",
+            Self::DecomposeVec2X => "Vec2 X",
+            Self::DecomposeVec2Y => "Vec2 Y",
+            Self::DecomposeVec3X => "Vec3 X",
+            Self::DecomposeVec3Y => "Vec3 Y",
+            Self::DecomposeVec3Z => "Vec3 Z",
+            Self::DecomposeVec4X => "Vec4 X",
+            Self::DecomposeVec4Y => "Vec4 Y",
+            Self::DecomposeVec4Z => "Vec4 Z",
+            Self::DecomposeVec4W => "Vec4 W",
             Self::LygiaRandom => "LYGIA Random",
             Self::LygiaValueNoise => "LYGIA Value Noise",
             Self::LygiaFbm => "LYGIA FBM",
@@ -180,6 +204,15 @@ impl NodeKind {
             | Self::LygiaLuma
             | Self::LygiaInvert
             | Self::LygiaCosinePalette
+            | Self::DecomposeVec2X
+            | Self::DecomposeVec2Y
+            | Self::DecomposeVec3X
+            | Self::DecomposeVec3Y
+            | Self::DecomposeVec3Z
+            | Self::DecomposeVec4X
+            | Self::DecomposeVec4Y
+            | Self::DecomposeVec4Z
+            | Self::DecomposeVec4W
             | Self::FragmentOutput
             | Self::TextureSample => 1,
             Self::Add
@@ -199,6 +232,9 @@ impl NodeKind {
             | Self::LygiaGammaCorrect
             | Self::LygiaBlendScreen
             | Self::LygiaBlendOverlay => 2,
+            Self::ComposeVec3 => 3,
+            Self::ComposeVec4 => 4,
+            Self::ComposeVec2 => 2,
         }
     }
 }

@@ -419,12 +419,14 @@ where
         let mut extra_responses: Vec<NodeResponse<UserResponse, NodeData>> = Vec::new();
 
         let mut context_node_requested = false;
+        let mut connection_completed = false;
         for response in delayed_responses.iter() {
             match response {
                 NodeResponse::ConnectEventStarted(node_id, port) => {
                     self.connection_in_progress = Some((*node_id, *port));
                 }
                 NodeResponse::ConnectEventEnded { input, output } => {
+                    connection_completed = true;
                     self.graph.add_connection(*output, *input)
                 }
                 NodeResponse::CreatedNode(_) => {
@@ -487,6 +489,8 @@ where
             }
         }
 
+        let cursor_over_node = node_rects.values().any(|rect| rect.contains(cursor_pos));
+
         // Handle box selection
         if let Some(box_start) = self.ongoing_box_selection {
             let selection_rect = Rect::from_two_pos(cursor_pos, box_start);
@@ -523,6 +527,9 @@ where
         let mouse = &ui.ctx().input(|i| i.pointer.clone());
 
         if mouse.any_released() && self.connection_in_progress.is_some() {
+            if !connection_completed && cursor_in_editor && !cursor_in_finder && !cursor_over_node {
+                self.node_finder = Some(NodeFinder::new_at(cursor_pos));
+            }
             self.connection_in_progress = None;
         }
 

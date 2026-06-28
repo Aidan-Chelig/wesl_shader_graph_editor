@@ -112,6 +112,18 @@ impl GraphDataType {
             NodeKind::Uv => Some(Self::Vec2),
             NodeKind::Time => Some(Self::F32),
             NodeKind::FragmentOutput => None,
+            NodeKind::ComposeVec2 => Some(Self::Vec2),
+            NodeKind::ComposeVec3 => Some(Self::Vec3),
+            NodeKind::ComposeVec4 => Some(Self::Vec4),
+            NodeKind::DecomposeVec2X
+            | NodeKind::DecomposeVec2Y
+            | NodeKind::DecomposeVec3X
+            | NodeKind::DecomposeVec3Y
+            | NodeKind::DecomposeVec3Z
+            | NodeKind::DecomposeVec4X
+            | NodeKind::DecomposeVec4Y
+            | NodeKind::DecomposeVec4Z
+            | NodeKind::DecomposeVec4W => Some(Self::F32),
             NodeKind::Add
             | NodeKind::Subtract
             | NodeKind::Multiply
@@ -432,6 +444,18 @@ pub enum GraphNodeTemplate {
     Abs,
     Fract,
     Normalize,
+    ComposeVec2,
+    ComposeVec3,
+    ComposeVec4,
+    DecomposeVec2X,
+    DecomposeVec2Y,
+    DecomposeVec3X,
+    DecomposeVec3Y,
+    DecomposeVec3Z,
+    DecomposeVec4X,
+    DecomposeVec4Y,
+    DecomposeVec4Z,
+    DecomposeVec4W,
     LygiaRandom,
     LygiaValueNoise,
     LygiaFbm,
@@ -529,6 +553,18 @@ impl GraphNodeTemplate {
             Self::Abs => NodeKind::Abs,
             Self::Fract => NodeKind::Fract,
             Self::Normalize => NodeKind::Normalize,
+            Self::ComposeVec2 => NodeKind::ComposeVec2,
+            Self::ComposeVec3 => NodeKind::ComposeVec3,
+            Self::ComposeVec4 => NodeKind::ComposeVec4,
+            Self::DecomposeVec2X => NodeKind::DecomposeVec2X,
+            Self::DecomposeVec2Y => NodeKind::DecomposeVec2Y,
+            Self::DecomposeVec3X => NodeKind::DecomposeVec3X,
+            Self::DecomposeVec3Y => NodeKind::DecomposeVec3Y,
+            Self::DecomposeVec3Z => NodeKind::DecomposeVec3Z,
+            Self::DecomposeVec4X => NodeKind::DecomposeVec4X,
+            Self::DecomposeVec4Y => NodeKind::DecomposeVec4Y,
+            Self::DecomposeVec4Z => NodeKind::DecomposeVec4Z,
+            Self::DecomposeVec4W => NodeKind::DecomposeVec4W,
             Self::LygiaRandom => NodeKind::LygiaRandom,
             Self::LygiaValueNoise => NodeKind::LygiaValueNoise,
             Self::LygiaFbm => NodeKind::LygiaFbm,
@@ -612,6 +648,18 @@ impl NodeTemplateIter for GraphNodeTemplates {
             GraphNodeTemplate::Abs,
             GraphNodeTemplate::Fract,
             GraphNodeTemplate::Normalize,
+            GraphNodeTemplate::ComposeVec2,
+            GraphNodeTemplate::ComposeVec3,
+            GraphNodeTemplate::ComposeVec4,
+            GraphNodeTemplate::DecomposeVec2X,
+            GraphNodeTemplate::DecomposeVec2Y,
+            GraphNodeTemplate::DecomposeVec3X,
+            GraphNodeTemplate::DecomposeVec3Y,
+            GraphNodeTemplate::DecomposeVec3Z,
+            GraphNodeTemplate::DecomposeVec4X,
+            GraphNodeTemplate::DecomposeVec4Y,
+            GraphNodeTemplate::DecomposeVec4Z,
+            GraphNodeTemplate::DecomposeVec4W,
             GraphNodeTemplate::LygiaRandom,
             GraphNodeTemplate::LygiaValueNoise,
             GraphNodeTemplate::LygiaFbm,
@@ -703,6 +751,18 @@ pub fn template_label(template: &GraphNodeTemplate) -> &'static str {
         GraphNodeTemplate::Vec3Uniform => "vec3 Uniform",
         GraphNodeTemplate::Vec4Uniform => "vec4 Uniform",
         GraphNodeTemplate::FragmentOutput => "Fragment Output",
+        GraphNodeTemplate::ComposeVec2 => "Compose vec2",
+        GraphNodeTemplate::ComposeVec3 => "Compose vec3",
+        GraphNodeTemplate::ComposeVec4 => "Compose vec4",
+        GraphNodeTemplate::DecomposeVec2X => "Vec2 X",
+        GraphNodeTemplate::DecomposeVec2Y => "Vec2 Y",
+        GraphNodeTemplate::DecomposeVec3X => "Vec3 X",
+        GraphNodeTemplate::DecomposeVec3Y => "Vec3 Y",
+        GraphNodeTemplate::DecomposeVec3Z => "Vec3 Z",
+        GraphNodeTemplate::DecomposeVec4X => "Vec4 X",
+        GraphNodeTemplate::DecomposeVec4Y => "Vec4 Y",
+        GraphNodeTemplate::DecomposeVec4Z => "Vec4 Z",
+        GraphNodeTemplate::DecomposeVec4W => "Vec4 W",
         _ => template.kind().title(),
     }
 }
@@ -727,20 +787,32 @@ fn template_category(template: &GraphNodeTemplate) -> &'static str {
         | GraphNodeTemplate::Abs
         | GraphNodeTemplate::Fract
         | GraphNodeTemplate::Normalize => "04 Math",
+        GraphNodeTemplate::ComposeVec2
+        | GraphNodeTemplate::ComposeVec3
+        | GraphNodeTemplate::ComposeVec4
+        | GraphNodeTemplate::DecomposeVec2X
+        | GraphNodeTemplate::DecomposeVec2Y
+        | GraphNodeTemplate::DecomposeVec3X
+        | GraphNodeTemplate::DecomposeVec3Y
+        | GraphNodeTemplate::DecomposeVec3Z
+        | GraphNodeTemplate::DecomposeVec4X
+        | GraphNodeTemplate::DecomposeVec4Y
+        | GraphNodeTemplate::DecomposeVec4Z
+        | GraphNodeTemplate::DecomposeVec4W => "05 Vectors",
         GraphNodeTemplate::LygiaRandom
         | GraphNodeTemplate::LygiaValueNoise
         | GraphNodeTemplate::LygiaFbm
-        | GraphNodeTemplate::LygiaVoronoi => "05 LYGIA Generative",
+        | GraphNodeTemplate::LygiaVoronoi => "06 LYGIA Generative",
         GraphNodeTemplate::LygiaPow2
         | GraphNodeTemplate::LygiaPow3
-        | GraphNodeTemplate::LygiaSaturate => "06 LYGIA Math",
+        | GraphNodeTemplate::LygiaSaturate => "07 LYGIA Math",
         GraphNodeTemplate::LygiaCenter
         | GraphNodeTemplate::LygiaUncenter
         | GraphNodeTemplate::LygiaScale2d
-        | GraphNodeTemplate::LygiaRotate2d => "07 LYGIA Space",
+        | GraphNodeTemplate::LygiaRotate2d => "08 LYGIA Space",
         GraphNodeTemplate::LygiaCircleSdf
         | GraphNodeTemplate::LygiaRectSdf
-        | GraphNodeTemplate::LygiaBoxSdf => "08 LYGIA SDF",
+        | GraphNodeTemplate::LygiaBoxSdf => "09 LYGIA SDF",
         GraphNodeTemplate::LygiaLuma
         | GraphNodeTemplate::LygiaInvert
         | GraphNodeTemplate::LygiaBrightness
@@ -750,9 +822,9 @@ fn template_category(template: &GraphNodeTemplate) -> &'static str {
         | GraphNodeTemplate::LygiaGammaCorrect
         | GraphNodeTemplate::LygiaBlendScreen
         | GraphNodeTemplate::LygiaBlendOverlay
-        | GraphNodeTemplate::LygiaCosinePalette => "09 LYGIA Color",
-        GraphNodeTemplate::TextureSample => "10 Textures",
-        GraphNodeTemplate::FragmentOutput => "11 Outputs",
+        | GraphNodeTemplate::LygiaCosinePalette => "10 LYGIA Color",
+        GraphNodeTemplate::TextureSample => "11 Textures",
+        GraphNodeTemplate::FragmentOutput => "12 Outputs",
     }
 }
 
@@ -984,6 +1056,20 @@ fn input_type(kind: &NodeKind, input_index: usize) -> GraphDataType {
             .unwrap_or(GraphDataType::Any),
         (NodeKind::FragmentOutput, 0) => GraphDataType::Vec4,
         (NodeKind::TextureSample, 0) => GraphDataType::Vec2,
+        (NodeKind::ComposeVec2 | NodeKind::ComposeVec3 | NodeKind::ComposeVec4, _) => {
+            GraphDataType::F32
+        }
+        (NodeKind::DecomposeVec2X | NodeKind::DecomposeVec2Y, 0) => GraphDataType::Vec2,
+        (NodeKind::DecomposeVec3X | NodeKind::DecomposeVec3Y | NodeKind::DecomposeVec3Z, 0) => {
+            GraphDataType::Vec3
+        }
+        (
+            NodeKind::DecomposeVec4X
+            | NodeKind::DecomposeVec4Y
+            | NodeKind::DecomposeVec4Z
+            | NodeKind::DecomposeVec4W,
+            0,
+        ) => GraphDataType::Vec4,
         (NodeKind::LygiaValueNoise | NodeKind::LygiaFbm | NodeKind::LygiaVoronoi, 0) => {
             GraphDataType::Vec2
         }
@@ -1025,6 +1111,24 @@ fn input_label(kind: &NodeKind, input_index: usize) -> String {
         NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
             if input_index == 0 { "A" } else { "B" }
         }
+        NodeKind::ComposeVec2 | NodeKind::ComposeVec3 | NodeKind::ComposeVec4 => {
+            match input_index {
+                0 => "X",
+                1 => "Y",
+                2 => "Z",
+                3 => "W",
+                _ => "",
+            }
+        }
+        NodeKind::DecomposeVec2X
+        | NodeKind::DecomposeVec2Y
+        | NodeKind::DecomposeVec3X
+        | NodeKind::DecomposeVec3Y
+        | NodeKind::DecomposeVec3Z
+        | NodeKind::DecomposeVec4X
+        | NodeKind::DecomposeVec4Y
+        | NodeKind::DecomposeVec4Z
+        | NodeKind::DecomposeVec4W => "Vector",
         NodeKind::LygiaRandom => "Seed",
         NodeKind::LygiaValueNoise => "Position",
         NodeKind::LygiaFbm => "Position",

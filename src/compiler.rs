@@ -1158,6 +1158,18 @@ impl Compiler<'_> {
                     expression: format!("normalize({})", input.expression),
                 }
             }
+            NodeKind::ComposeVec2 => self.compile_compose(node, 2, ShaderType::Vec2)?,
+            NodeKind::ComposeVec3 => self.compile_compose(node, 3, ShaderType::Vec3)?,
+            NodeKind::ComposeVec4 => self.compile_compose(node, 4, ShaderType::Vec4)?,
+            NodeKind::DecomposeVec2X => self.compile_decompose(node, ShaderType::Vec2, "x")?,
+            NodeKind::DecomposeVec2Y => self.compile_decompose(node, ShaderType::Vec2, "y")?,
+            NodeKind::DecomposeVec3X => self.compile_decompose(node, ShaderType::Vec3, "x")?,
+            NodeKind::DecomposeVec3Y => self.compile_decompose(node, ShaderType::Vec3, "y")?,
+            NodeKind::DecomposeVec3Z => self.compile_decompose(node, ShaderType::Vec3, "z")?,
+            NodeKind::DecomposeVec4X => self.compile_decompose(node, ShaderType::Vec4, "x")?,
+            NodeKind::DecomposeVec4Y => self.compile_decompose(node, ShaderType::Vec4, "y")?,
+            NodeKind::DecomposeVec4Z => self.compile_decompose(node, ShaderType::Vec4, "z")?,
+            NodeKind::DecomposeVec4W => self.compile_decompose(node, ShaderType::Vec4, "w")?,
             NodeKind::TextureSample => {
                 let uv = self.input(node, 0)?;
                 if uv.shader_type != ShaderType::Vec2 {
@@ -1206,6 +1218,48 @@ impl Compiler<'_> {
                 input: index,
             })?;
         self.compile_node(connection.node)
+    }
+
+    fn compile_compose(
+        &mut self,
+        node: &Node,
+        width: usize,
+        shader_type: ShaderType,
+    ) -> Result<CompiledNode, CompileError> {
+        let mut inputs = Vec::with_capacity(width);
+        for index in 0..width {
+            let input = self.input(node, index)?;
+            if input.shader_type != ShaderType::F32 {
+                return Err(type_mismatch(node, "compose vector", &[input.shader_type]));
+            }
+            inputs.push(input.expression);
+        }
+
+        Ok(CompiledNode {
+            shader_type,
+            expression: format!("{}({})", shader_type.wgsl(), inputs.join(", ")),
+        })
+    }
+
+    fn compile_decompose(
+        &mut self,
+        node: &Node,
+        vector_type: ShaderType,
+        component: &'static str,
+    ) -> Result<CompiledNode, CompileError> {
+        let input = self.input(node, 0)?;
+        if input.shader_type != vector_type {
+            return Err(type_mismatch(
+                node,
+                "decompose vector",
+                &[input.shader_type],
+            ));
+        }
+
+        Ok(CompiledNode {
+            shader_type: ShaderType::F32,
+            expression: format!("{}.{}", input.expression, component),
+        })
     }
 
     fn optional_input(&mut self, node: &Node, index: usize) -> Result<CompiledNode, CompileError> {
@@ -1779,6 +1833,28 @@ mod tests {
         .unwrap();
         assert!(compiled.wgsl.contains("// LYGIA: sdf/boxSDF.wgsl"));
         assert!(compiled.wgsl.contains("fn lygia_box_sdf"));
+    }
+
+    #[test]
+    fn vector_compose_and_decompose_nodes_emit_valid_wgsl() {
+        let compiled = compile(&lygia_graph([
+            (NodeId(1), NodeKind::Constant(Value::F32(0.25)), vec![]),
+            (NodeId(2), NodeKind::Constant(Value::F32(0.5)), vec![]),
+            (NodeId(3), NodeKind::Constant(Value::F32(0.75)), vec![]),
+            (NodeId(4), NodeKind::Constant(Value::F32(1.0)), vec![]),
+            (
+                NodeId(5),
+                NodeKind::ComposeVec4,
+                vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            ),
+            (NodeId(6), NodeKind::DecomposeVec4Z, vec![NodeId(5)]),
+        ]))
+        .unwrap();
+
+        assert!(compiled.wgsl.contains("let node_5: vec4<f32> = vec4<f32>("));
+        assert!(compiled.wgsl.contains("let node_6: f32 = node_5.z;"));
+        assert_eq!(compiled.node_types[&NodeId(5)], ShaderType::Vec4);
+        assert_eq!(compiled.node_types[&NodeId(6)], ShaderType::F32);
     }
 
     fn lygia_graph<const N: usize>(
