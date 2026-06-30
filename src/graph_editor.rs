@@ -639,6 +639,7 @@ impl NodeDataTrait for GraphNodeData {
         let mut responses = Vec::new();
         ui.push_id(("bottom", self.shader_id.0), |ui| match &self.kind {
             NodeKind::Constant(value) => {
+                draw_node_name(ui, node_id, graph, self.shader_id, &mut responses);
                 draw_value(
                     ui,
                     self.shader_id,
@@ -649,16 +650,7 @@ impl NodeDataTrait for GraphNodeData {
                 );
             }
             NodeKind::Uniform(value) => {
-                let mut name = graph.nodes[node_id].label.clone();
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    if ui.text_edit_singleline(&mut name).changed() {
-                        responses.push(NodeResponse::User(GraphResponse::RenameNode {
-                            node: self.shader_id,
-                            name: name.trim().to_owned(),
-                        }));
-                    }
-                });
+                draw_node_name(ui, node_id, graph, self.shader_id, &mut responses);
                 ui.label("Preview value");
                 draw_value(
                     ui,
@@ -748,6 +740,25 @@ impl NodeDataTrait for GraphNodeData {
             (color.b() / 3).saturating_add(48),
         ))
     }
+}
+
+fn draw_node_name(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    graph: &Graph<GraphNodeData, GraphDataType, GraphValue>,
+    shader_id: ShaderNodeId,
+    responses: &mut Vec<NodeResponse<GraphResponse, GraphNodeData>>,
+) {
+    let mut name = graph.nodes[node_id].label.clone();
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        if ui.text_edit_singleline(&mut name).changed() {
+            responses.push(NodeResponse::User(GraphResponse::RenameNode {
+                node: shader_id,
+                name: name.trim().to_owned(),
+            }));
+        }
+    });
 }
 
 fn resolved_node_output_port_type(
